@@ -135,6 +135,9 @@ impl Default for Settings {
 /// 自律会話のターン数上限(設定値の上限。設計 FR-14)
 pub const AUTO_TURN_HARD_MAX: i64 = 50;
 
+/// 自律会話の参加ペルソナ数の上限 (FR-19, ADR-08)
+pub const MAX_AUTONOMOUS_PARTICIPANTS: usize = 6;
+
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }

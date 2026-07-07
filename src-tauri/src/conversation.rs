@@ -76,11 +76,12 @@ pub fn start_session(
 ) -> AppResult<Session> {
     match kind {
         "user_dialogue" if persona_ids.len() == 1 => {}
-        "autonomous" if persona_ids.len() == 2 => {}
+        // FR-19: 自律会話は2〜MAX体
+        "autonomous" if (2..=MAX_AUTONOMOUS_PARTICIPANTS).contains(&persona_ids.len()) => {}
         "user_dialogue" | "autonomous" => {
-            return Err(AppError::Validation(
-                "参加ペルソナ数が不正です (1対1対話は1体、自律会話は2体)".into(),
-            ))
+            return Err(AppError::Validation(format!(
+                "参加ペルソナ数が不正です (1対1対話は1体、自律会話は2〜{MAX_AUTONOMOUS_PARTICIPANTS}体)"
+            )))
         }
         _ => return Err(AppError::Validation(format!("不明なセッション種別: {kind}"))),
     }
@@ -154,19 +155,13 @@ pub async fn send_user_message(ctx: &AppCtx, session_id: &str, text: &str) -> Ap
         .get_persona(&session.participant_ids[0])?
         .ok_or_else(|| AppError::NotFound("ペルソナが見つかりません".into()))?;
 
-    generate_reply(ctx, &session, &persona, "user", "user", "ユーザー").await?;
+    generate_reply(ctx, &session, &persona).await?;
     Ok(())
 }
 
 /// 1発話の生成 (想起→プロンプト→ストリーミング→保存)。1対1と自律会話で共用。
-async fn generate_reply(
-    ctx: &AppCtx,
-    session: &Session,
-    speaker: &Persona,
-    partner_kind: &str,
-    partner_id: &str,
-    partner_name: &str,
-) -> AppResult<Utterance> {
+/// 会話相手はセッションから導出する (1対1=ユーザー、自律会話=自分以外の全参加者: FR-19)
+async fn generate_reply(ctx: &AppCtx, session: &Session, speaker: &Persona) -> AppResult<Utterance> {
     let settings = ctx.db.load_settings()?;
     let history = ctx.db.utterances_of(&session.id)?;
 
@@ -194,10 +189,23 @@ async fn generate_reply(
         memory::retrieve(&ctx.db, &speaker.id, query_emb.as_deref(), &settings, now_ms())?;
 
     let traits = ctx.db.traits_of(&speaker.id)?;
-    let relationship = ctx.db.get_relationship(&speaker.id, partner_kind, partner_id)?;
+    // 会話相手と関係性の一覧を組み立てる
+    let mut partners: Vec<(String, Option<crate::models::Relationship>)> = Vec::new();
+    if session.kind == "user_dialogue" {
+        partners.push(("ユーザー".to_string(), ctx.db.get_relationship(&speaker.id, "user", "user")?));
+    } else {
+        for (pid, pname) in session.participant_ids.iter().zip(session.participant_names.iter()) {
+            if pid != &speaker.id {
+                partners.push((pname.clone(), ctx.db.get_relationship(&speaker.id, "persona", pid)?));
+            }
+        }
+    }
+    let partner_infos: Vec<prompt::PartnerInfo> = partners
+        .iter()
+        .map(|(name, rel)| prompt::PartnerInfo { name, relationship: rel.as_ref() })
+        .collect();
     let theme = if session.kind == "autonomous" { Some(session.theme.as_str()) } else { None };
-    let system =
-        prompt::build_system(speaker, &traits, relationship.as_ref(), partner_name, &memories, theme);
+    let system = prompt::build_system(speaker, &traits, &partner_infos, &memories, theme);
     let messages =
         prompt::assemble_messages(system, &history, &speaker.id, settings.context_chars.max(1000) as usize);
 
@@ -294,9 +302,9 @@ pub async fn run_autonomous(ctx: &AppCtx, session_id: &str) -> AppResult<()> {
         if ctx.conv.is_stopped(session_id) {
             break;
         }
-        let speaker = &personas[(turn % 2) as usize];
-        let partner = &personas[((turn + 1) % 2) as usize];
-        match generate_reply(ctx, &session, speaker, "persona", &partner.id, &partner.name).await {
+        // ADR-08: 発話順は参加者の登録順で巡回する (ラウンドロビン)。FR-19
+        let speaker = &personas[(turn as usize) % personas.len()];
+        match generate_reply(ctx, &session, speaker).await {
             Ok(_) => consecutive_failures = 0,
             Err(e) => {
                 consecutive_failures += 1;
@@ -452,6 +460,60 @@ mod tests {
         let utts = env.ctx.db.utterances_of(&s.id).unwrap();
         assert!(utts.len() < 4, "停止フラグで上限前に止まる (実際: {}件)", utts.len());
         assert_eq!(env.ctx.db.get_session(&s.id).unwrap().unwrap().status, "ended");
+    }
+
+    /// FR-19 受け入れ基準: 3体を指定して開始すると全員の発話が1回以上現れる
+    #[tokio::test]
+    async fn three_personas_round_robin_fr19() {
+        let env = test_ctx(MockInference::with_replies(&[
+            "発話1", "発話2", "発話3", "発話4", "発話5", "発話6",
+        ]));
+        let mut settings = env.ctx.db.load_settings().unwrap();
+        settings.auto_turn_limit = 6;
+        env.ctx.db.save_settings(&settings).unwrap();
+
+        let a = add_persona(&env.ctx, "アリス");
+        let b = add_persona(&env.ctx, "ボブ");
+        let c = add_persona(&env.ctx, "キャロル");
+        let s = start_session(
+            &env.ctx,
+            "autonomous",
+            &[a.id.clone(), b.id.clone(), c.id.clone()],
+            "三人の話題",
+        )
+        .unwrap();
+        run_autonomous(&env.ctx, &s.id).await.unwrap();
+
+        let utts = env.ctx.db.utterances_of(&s.id).unwrap();
+        assert_eq!(utts.len(), 6);
+        // ラウンドロビン (ADR-08): 登録順で巡回
+        let order: Vec<&str> = utts.iter().map(|u| u.speaker_id.as_str()).collect();
+        assert_eq!(order, vec![&a.id, &b.id, &c.id, &a.id, &b.id, &c.id]
+            .iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        // 全員が1回以上発話 (FR-19 受け入れ基準)
+        for pid in [&a.id, &b.id, &c.id] {
+            assert!(utts.iter().any(|u| &u.speaker_id == pid));
+        }
+        assert_eq!(env.ctx.db.get_session(&s.id).unwrap().unwrap().status, "ended");
+    }
+
+    #[tokio::test]
+    async fn autonomous_participant_count_validated_fr19() {
+        let env = test_ctx(MockInference::default());
+        let personas: Vec<String> =
+            (0..7).map(|i| add_persona(&env.ctx, &format!("P{i}")).id).collect();
+        // 1体は不可
+        assert_eq!(
+            start_session(&env.ctx, "autonomous", &personas[..1], "").unwrap_err().kind(),
+            "validation"
+        );
+        // 上限(6体)超過は不可
+        assert_eq!(
+            start_session(&env.ctx, "autonomous", &personas[..7], "").unwrap_err().kind(),
+            "validation"
+        );
+        // 6体は開始できる
+        start_session(&env.ctx, "autonomous", &personas[..6], "").unwrap();
     }
 
     #[tokio::test]

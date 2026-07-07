@@ -279,38 +279,49 @@ pub async fn postprocess_session(ctx: &AppCtx, session_id: &str) -> AppResult<()
         }
 
         // 3. 人格評定 → 4. クランプ適用 (FR-12: 上限はコード側で強制)
-        let (partner_kind, partner_id, partner_name) = if session.kind == "user_dialogue" {
-            ("user".to_string(), "user".to_string(), "ユーザー".to_string())
+        // 相手一覧: 1対1=ユーザー、自律会話=自分以外の全参加者 (FR-19。名前スナップショットを使う EC-07)
+        let partners: Vec<(String, String, String)> = if session.kind == "user_dialogue" {
+            vec![("user".to_string(), "user".to_string(), "ユーザー".to_string())]
         } else {
-            // 自律会話: 自分以外の参加者 (名前スナップショットを使う EC-07)
-            match participants.iter().find(|(other_id, _, _)| other_id != pid) {
-                Some((oid, oname, _)) => ("persona".to_string(), oid.clone(), oname.clone()),
-                None => ("user".to_string(), "user".to_string(), "ユーザー".to_string()),
-            }
+            participants
+                .iter()
+                .filter(|(other_id, _, _)| other_id != pid)
+                .map(|(oid, oname, _)| ("persona".to_string(), oid.clone(), oname.clone()))
+                .collect()
         };
         let traits = ctx.db.traits_of(pid)?;
-        let current_intimacy = ctx
-            .db
-            .get_relationship(pid, &partner_kind, &partner_id)?
-            .map(|r| r.intimacy)
-            .unwrap_or(personality::DEFAULT_INTIMACY);
+        // ADR-08: 性格軸デルタは相手ごとに重ねず、セッションあたり1回だけ適用する
+        // (相手数分適用すると FR-12 の1セッション変化量上限を実質超えるため)
+        let mut traits_applied = false;
+        for (partner_kind, partner_id, partner_name) in &partners {
+            let current_intimacy = ctx
+                .db
+                .get_relationship(pid, partner_kind, partner_id)?
+                .map(|r| r.intimacy)
+                .unwrap_or(personality::DEFAULT_INTIMACY);
 
-        if let Some(assess_v) = chat_json_with_retry(
-            ctx,
-            &settings.chat_model,
-            assessment_prompt(&persona, &traits, &partner_name, current_intimacy, &transcript),
-        )
-        .await
-        {
-            let (trait_deltas, pa) = parse_assessment(&assess_v);
-            let ev1 =
-                personality::apply_trait_deltas(&ctx.db, pid, session_id, &trait_deltas, &settings, now_ms())?;
-            let ev2 = personality::apply_relationship(
-                &ctx.db, pid, session_id, &partner_kind, &partner_id, &partner_name, &pa, &settings, now_ms(),
-            )?;
-            total_events += ev1.len() + ev2.len();
-        } else {
-            tracing::warn!("人格評定に失敗 (このセッションの評定をスキップ): persona={pname}");
+            if let Some(assess_v) = chat_json_with_retry(
+                ctx,
+                &settings.chat_model,
+                assessment_prompt(&persona, &traits, partner_name, current_intimacy, &transcript),
+            )
+            .await
+            {
+                let (trait_deltas, pa) = parse_assessment(&assess_v);
+                if !traits_applied {
+                    let ev1 = personality::apply_trait_deltas(
+                        &ctx.db, pid, session_id, &trait_deltas, &settings, now_ms(),
+                    )?;
+                    total_events += ev1.len();
+                    traits_applied = true;
+                }
+                let ev2 = personality::apply_relationship(
+                    &ctx.db, pid, session_id, partner_kind, partner_id, partner_name, &pa, &settings, now_ms(),
+                )?;
+                total_events += ev2.len();
+            } else {
+                tracing::warn!("人格評定に失敗 (この相手の評定をスキップ): persona={pname} partner={partner_name}");
+            }
         }
 
         ctx.db.mark_participant_processed(session_id, pid)?;
@@ -515,6 +526,57 @@ mod tests {
         assert_eq!(rel_ab.target_name, "ボブ");
         let rel_ba = env.ctx.db.get_relationship(&b.id, "persona", &a.id).unwrap().unwrap();
         assert_eq!(rel_ba.intimacy, personality::DEFAULT_INTIMACY + 3);
+        assert_eq!(env.ctx.db.get_session(&s.id).unwrap().unwrap().status, "processed");
+    }
+
+    /// FR-19: 3体の自律会話は各参加者が「他の2体それぞれ」との関係性を得る。
+    /// 性格軸はセッションあたり1回のみ適用され FR-12 の上限内に収まる。
+    #[tokio::test]
+    async fn postprocess_three_participants() {
+        // 各ペルソナ: 抽出1回 + 評定2回 (相手2体分) = 3体で9応答
+        let mut replies: Vec<String> = Vec::new();
+        for _ in 0..3 {
+            replies.push(r#"[{"content":"三人で旅行の計画を立てた","kind":"event","importance":5}]"#.into());
+            // 両方の評定が sociability +2 を返す → 2回適用なら +4 になってしまうケース
+            replies.push(r#"{"traits":{"sociability":2},"intimacy_delta":3,"impression":"良い人"}"#.into());
+            replies.push(r#"{"traits":{"sociability":2},"intimacy_delta":4,"impression":"面白い人"}"#.into());
+        }
+        let reply_refs: Vec<&str> = replies.iter().map(|s| s.as_str()).collect();
+        let env = test_ctx(MockInference::with_replies(&reply_refs));
+        let mut settings = env.ctx.db.load_settings().unwrap();
+        settings.chat_model = "mock".into();
+        env.ctx.db.save_settings(&settings).unwrap();
+
+        let a = add_persona(&env.ctx, "アリス");
+        let b = add_persona(&env.ctx, "ボブ");
+        let c = add_persona(&env.ctx, "キャロル");
+        let s = start_session(
+            &env.ctx,
+            "autonomous",
+            &[a.id.clone(), b.id.clone(), c.id.clone()],
+            "旅行",
+        )
+        .unwrap();
+        env.ctx.db.insert_utterance(&Utterance {
+            id: new_id(), session_id: s.id.clone(), speaker_kind: "persona".into(),
+            speaker_id: a.id.clone(), speaker_name: "アリス".into(),
+            content: "旅行に行きましょう".into(), state: "complete".into(), created_at: now_ms(),
+        }).unwrap();
+        end_session(&env.ctx, &s.id).unwrap();
+
+        postprocess_session(&env.ctx, &s.id).await.unwrap();
+
+        // 各参加者が他の2体との関係性を持つ
+        for (me, others) in [(&a, [&b, &c]), (&b, [&a, &c]), (&c, [&a, &b])] {
+            for other in others {
+                let rel = env.ctx.db.get_relationship(&me.id, "persona", &other.id).unwrap();
+                assert!(rel.is_some(), "{}→{} の関係性がない", me.name, other.name);
+            }
+            // FR-12: 性格軸は +2(上限) まで。2相手分の +2 が重なって +4 にならない
+            let soc = env.ctx.db.traits_of(&me.id).unwrap()
+                .iter().find(|t| t.key == "sociability").unwrap().value;
+            assert_eq!(soc, 52, "{} の性格変化がセッション上限を超えている", me.name);
+        }
         assert_eq!(env.ctx.db.get_session(&s.id).unwrap().unwrap().status, "processed");
     }
 

@@ -34,12 +34,17 @@ fn format_date(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// 会話相手1人分の情報 (自律会話では自分以外の全参加者分を渡す: FR-19)
+pub struct PartnerInfo<'a> {
+    pub name: &'a str,
+    pub relationship: Option<&'a Relationship>,
+}
+
 /// system プロンプトを組み立てる (設計6.4 の構成順)
 pub fn build_system(
     persona: &Persona,
     traits: &[TraitValue],
-    relationship: Option<&Relationship>,
-    partner_name: &str,
+    partners: &[PartnerInfo],
     memories: &[Memory],
     theme: Option<&str>,
 ) -> String {
@@ -56,15 +61,25 @@ pub fn build_system(
             s.push_str(&format!("- {}\n", trait_phrase(&t.key, t.value)));
         }
     }
-    // 3. 相手との関係性
-    s.push_str(&format!("\n## 会話相手: {partner_name}\n"));
-    if let Some(rel) = relationship {
-        s.push_str(&format!("- 距離感: {}\n", intimacy_phrase(rel.intimacy)));
-        if !rel.impression_text.is_empty() {
-            s.push_str(&format!("- あなたが抱いている印象: {}\n", rel.impression_text));
-        }
+    // 3. 相手との関係性 (複数相手なら全員分: FR-19)
+    if partners.len() == 1 {
+        s.push_str(&format!("\n## 会話相手: {}\n", partners[0].name));
     } else {
-        s.push_str("- 初対面の相手である\n");
+        let names: Vec<&str> = partners.iter().map(|p| p.name).collect();
+        s.push_str(&format!("\n## 会話相手 (複数): {}\n", names.join("、")));
+    }
+    for p in partners {
+        if partners.len() > 1 {
+            s.push_str(&format!("### {}\n", p.name));
+        }
+        if let Some(rel) = p.relationship {
+            s.push_str(&format!("- 距離感: {}\n", intimacy_phrase(rel.intimacy)));
+            if !rel.impression_text.is_empty() {
+                s.push_str(&format!("- あなたが抱いている印象: {}\n", rel.impression_text));
+            }
+        } else {
+            s.push_str("- 初対面の相手である\n");
+        }
     }
     // テーマ (自律会話 FR-14)
     if let Some(t) = theme {
@@ -180,7 +195,8 @@ mod tests {
             archived: false,
             user_edited: false,
         };
-        let s = build_system(&p, &traits, Some(&rel), "ユーザー", &[mem], None);
+        let partners = [PartnerInfo { name: "ユーザー", relationship: Some(&rel) }];
+        let s = build_system(&p, &traits, &partners, &[mem], None);
         assert!(s.contains("アリス"));
         assert!(s.contains("社交性: 高め(72/100)"));
         assert!(s.contains("親しい相手"));
@@ -192,8 +208,34 @@ mod tests {
     #[test]
     fn theme_included_for_autonomous() {
         let p = mk_persona();
-        let s = build_system(&p, &[], None, "ボブ", &[], Some("休日の過ごし方"));
+        let partners = [PartnerInfo { name: "ボブ", relationship: None }];
+        let s = build_system(&p, &[], &partners, &[], Some("休日の過ごし方"));
         assert!(s.contains("休日の過ごし方"));
+        assert!(s.contains("初対面"));
+    }
+
+    #[test]
+    fn multiple_partners_listed_fr19() {
+        let p = mk_persona();
+        let rel = Relationship {
+            persona_id: "p1".into(),
+            target_kind: "persona".into(),
+            target_id: "p2".into(),
+            target_name: "ボブ".into(),
+            intimacy: 70,
+            impression_text: "頼れる人".into(),
+            updated_at: now_ms(),
+        };
+        let partners = [
+            PartnerInfo { name: "ボブ", relationship: Some(&rel) },
+            PartnerInfo { name: "キャロル", relationship: None },
+        ];
+        let s = build_system(&p, &[], &partners, &[], Some("旅行の計画"));
+        // 全相手が列挙され、それぞれの関係性が出る
+        assert!(s.contains("ボブ、キャロル"));
+        assert!(s.contains("### ボブ"));
+        assert!(s.contains("頼れる人"));
+        assert!(s.contains("### キャロル"));
         assert!(s.contains("初対面"));
     }
 

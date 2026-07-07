@@ -86,7 +86,58 @@
 ## 未実装 (計画どおりのスコープ外)
 
 - FR-18 エクスポート/インポート (Could) — 設計9章どおり「詳細は実装時」のまま未着手
-- FR-19 3体以上の自律会話 (Could) — 拡張点(ターンループの発話者選択)のみ確保
+
+---
+
+## FR-19: 3体以上の自律会話 (2026-07-08 着手)
+
+ベースライン: `cargo test` 47 passed / `npm run build` 成功 (変更前に確認済み)
+
+### 設計判断 (ADR-08 として design.md に追記)
+
+- 発話順: **ラウンドロビン** (参加者の登録順で巡回)。受け入れ基準「全員が1回以上発話」を決定的に満たす
+- 参加数上限: **6体** (コンテキスト予算と後処理コストの上限として)
+- 後処理: 関係性評定は「自分以外の各参加者」ごとに実行。**性格軸デルタの適用はセッションあたり1回のみ**
+  (相手ごとに適用すると FR-12 の1セッション変化量上限±2を実質超えてしまうため)
+
+### ステップ (FR-19)
+
+- [ ] F1: prompt.rs — build_system を複数相手対応 (PartnerInfo 配列)。既存テスト調整+複数相手テスト
+      検証: `cargo test prompt`
+- [ ] F2: conversation.rs — 参加数検証(2〜6)、generate_reply が相手一覧をセッションから導出、
+      ターンループをラウンドロビン化。テスト: 3体巡回(FR-19受け入れ基準)、7体/1体の拒否
+      検証: `cargo test conversation`
+- [ ] F3: worker.rs — 相手ごとの関係性評定ループ + 性格デルタは1回のみ適用。テスト: 3体後処理
+      検証: `cargo test worker`
+- [ ] F4: フロント autonomous.ts — 2択セレクトをチェックボックス複数選択(2〜6)に変更
+      検証: `npm run build`
+- [ ] F5: design.md — ADR-08 追記、7章フロー2とトレーサビリティ表の FR-19 行を更新
+      検証: 目視 (トレーサビリティ行の整合)
+- [ ] F6: 全テスト + 完了検証
+      検証: `cargo test` 全件 / `npm run build`
+
+### 受け入れ基準→テスト対応 (FR-19)
+
+| 基準 | テスト |
+| --- | --- |
+| 3体指定で開始→全員が1回以上発話 | conversation::three_personas_round_robin (モック) |
+| (FR-12 整合) 多相手でも性格変化がセッション上限内 | worker::postprocess_three_participants |
+
+### 進捗記録 (FR-19)
+
+- F1+F2 完了: prompt.rs (PartnerInfo 複数相手)、conversation.rs (2〜6体検証・相手導出・ラウンドロビン)。
+  同一クレートのため一括検証: `cargo test` → 51 passed (+4: multiple_partners_listed_fr19,
+  three_personas_round_robin_fr19, autonomous_participant_count_validated_fr19, postprocess_three_participants)
+- F3 完了: worker.rs 相手ごとの評定ループ + 性格デルタ1回適用 (同上のテストで検証)
+- F4 完了: autonomous.ts チェックボックス複数選択 + styles.css。`npm run build` 成功
+- F5 完了: design.md v1.1 (ADR-08 追加、フロー2一般化、FR-19 トレーサビリティ更新)
+- F6 完了 (2026-07-08): `cargo test` **51 passed / 0 failed**、`npm run build` 成功。
+  diff 通読: 変更8ファイルすべて F1〜F5 に対応、無関係な変更なし
+
+### 逸脱記録 (FR-19)
+
+- 性格軸デルタを相手ごとに適用すると FR-12 の上限を超えるため「セッションあたり1回のみ適用」とする。
+  分類: 実装の自由範囲 (FR-12 の上限保証を優先する解釈)。ADR-08 に明記
 
 ## GUI手動確認項目 (npm run tauri dev で確認)
 

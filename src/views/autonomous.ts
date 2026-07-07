@@ -3,6 +3,9 @@ import type { Persona, Session } from "../types";
 import { errorMessage } from "../types";
 import { el, toast } from "../ui";
 
+const MIN_PARTICIPANTS = 2;
+const MAX_PARTICIPANTS = 6; // FR-19 / ADR-08
+
 export interface AutonomousController {
   root: HTMLElement;
   onUtteranceStarted(utteranceId: string, speakerName: string): void;
@@ -11,18 +14,33 @@ export interface AutonomousController {
   sessionId(): string | null;
 }
 
-/// 自律会話画面 (FR-14/15, EC-08/12)
+/// 自律会話画面 (FR-14/15/19, EC-08/12)
 export function autonomousView(personas: Persona[]): AutonomousController {
   let session: Session | null = null;
+  let participantNames: string[] = [];
 
-  const selectA = el("select", { class: "input" });
-  const selectB = el("select", { class: "input" });
-  for (const sel of [selectA, selectB]) {
-    for (const p of personas) {
-      sel.append(el("option", { value: p.id, text: p.name }));
-    }
-  }
-  if (personas.length > 1) selectB.selectedIndex = 1;
+  // FR-19: チェックボックスで2〜6体を選ぶ。発話順は一覧の並び順 (ラウンドロビン)
+  const checks: { persona: Persona; box: HTMLInputElement }[] = personas.map((p) => ({
+    persona: p,
+    box: el("input", { type: "checkbox" }),
+  }));
+  checks.slice(0, 2).forEach((c) => (c.box.checked = true));
+
+  const countLabel = el("span", { class: "muted", text: "" });
+  const updateCount = () => {
+    const n = checks.filter((c) => c.box.checked).length;
+    countLabel.textContent = `${n} 体選択中 (${MIN_PARTICIPANTS}〜${MAX_PARTICIPANTS}体)`;
+  };
+  checks.forEach((c) => c.box.addEventListener("change", updateCount));
+  updateCount();
+
+  const checkList = el(
+    "div",
+    { class: "auto-checks" },
+    checks.map((c) =>
+      el("label", { class: "auto-check" }, [c.box, c.persona.name]),
+    ),
+  );
 
   const themeInput = el("input", {
     class: "input",
@@ -39,21 +57,24 @@ export function autonomousView(personas: Persona[]): AutonomousController {
   const setRunning = (on: boolean) => {
     startBtn.style.display = on ? "none" : "";
     stopBtn.style.display = on ? "" : "none";
-    selectA.toggleAttribute("disabled", on);
-    selectB.toggleAttribute("disabled", on);
+    checks.forEach((c) => c.box.toggleAttribute("disabled", on));
     themeInput.toggleAttribute("disabled", on);
   };
 
   startBtn.addEventListener("click", async () => {
-    const a = selectA.value;
-    const b = selectB.value;
-    if (!a || !b || a === b) {
-      toast("異なる2体のペルソナを選んでください", "error");
+    const selected = checks.filter((c) => c.box.checked).map((c) => c.persona);
+    if (selected.length < MIN_PARTICIPANTS || selected.length > MAX_PARTICIPANTS) {
+      toast(`${MIN_PARTICIPANTS}〜${MAX_PARTICIPANTS}体のペルソナを選んでください`, "error");
       return;
     }
     messages.replaceChildren();
     try {
-      session = await api.startSession("autonomous", [a, b], themeInput.value);
+      session = await api.startSession(
+        "autonomous",
+        selected.map((p) => p.id),
+        themeInput.value,
+      );
+      participantNames = selected.map((p) => p.name);
       await api.startAutonomousTurns(session.id);
       setRunning(true);
       statusLabel.textContent = "会話中...";
@@ -75,11 +96,7 @@ export function autonomousView(personas: Persona[]): AutonomousController {
   const root = el("div", { class: "chat" }, [
     el("div", { class: "auto-controls" }, [
       el("h2", { text: "自律会話" }),
-      el("div", { class: "auto-row" }, [
-        selectA,
-        el("span", { class: "auto-x", text: "×" }),
-        selectB,
-      ]),
+      el("div", { class: "auto-row" }, [checkList, countLabel]),
       themeInput,
       el("div", { class: "auto-row" }, [startBtn, stopBtn, statusLabel]),
     ]),
@@ -90,7 +107,9 @@ export function autonomousView(personas: Persona[]): AutonomousController {
     root,
     sessionId: () => session?.id ?? null,
     onUtteranceStarted(utteranceId, speakerName) {
-      const side = speakerName === selectA.selectedOptions[0]?.text ? "bubble-persona" : "bubble-user";
+      // 参加者の並び順で左右を振り分ける (偶数=左、奇数=右)
+      const idx = participantNames.indexOf(speakerName);
+      const side = idx % 2 === 0 ? "bubble-persona" : "bubble-user";
       const bubble = el("div", { class: `bubble ${side}` }, [
         el("div", { class: "bubble-name", text: speakerName }),
         el("div", { class: "bubble-content", text: "" }),
