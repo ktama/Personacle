@@ -1,7 +1,8 @@
+import { open } from "@tauri-apps/plugin-dialog";
 import { api, subscribeEvents } from "./api";
 import type { Persona } from "./types";
-import { errorMessage } from "./types";
-import { clear, el, toast } from "./ui";
+import { errorMessage, isAppError } from "./types";
+import { clear, confirmDialog, el, toast } from "./ui";
 import { autonomousView, type AutonomousController } from "./views/autonomous";
 import { chatView, type ChatController } from "./views/chat";
 import { memoriesView } from "./views/memories";
@@ -127,6 +128,11 @@ class App {
         text: "+ 新しいペルソナ",
         onClick: () => void this.navigate({ kind: "create" }),
       }),
+      el("button", {
+        class: "side-item side-action",
+        text: "ファイルから取り込む",
+        onClick: () => void this.importPersona(),
+      }),
     );
     if (this.personas.length >= 2) {
       items.push(
@@ -230,6 +236,31 @@ class App {
         break;
     }
     return el("div", { class: "persona-area" }, [tabs, body]);
+  }
+
+  /// エクスポートファイルからのペルソナ取込 (FR-18)
+  private async importPersona(): Promise<void> {
+    const path = await open({
+      multiple: false,
+      filters: [{ name: "Personacle ペルソナ", extensions: ["json"] }],
+    });
+    if (typeof path !== "string") return;
+    const tryImport = async (force: boolean): Promise<void> => {
+      try {
+        const p = await api.importPersona(path, force);
+        toast(`「${p.name}」を取り込みました。記憶の索引を再構築しています`);
+        await this.reload(p.id);
+      } catch (e) {
+        // 同名は確認のうえ別個体として取込 (EC-04 相当)
+        if (isAppError(e) && e.kind === "duplicate_name") {
+          const ok = await confirmDialog(`${e.message}。別のペルソナとして取り込みますか?`);
+          if (ok) await tryImport(true);
+          return;
+        }
+        toast(errorMessage(e), "error");
+      }
+    };
+    await tryImport(false);
   }
 
   /// 初回起動時の案内 (EC-01)

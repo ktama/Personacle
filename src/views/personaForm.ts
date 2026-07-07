@@ -1,3 +1,4 @@
+import { save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import { TRAIT_LABELS, errorMessage, isAppError } from "../types";
 import type { PersonaDetail, PersonaInput, TraitValue } from "../types";
@@ -130,6 +131,41 @@ export function personaFormView(opts: PersonaFormOptions): HTMLElement {
     );
   }
 
+  // FR-18: エクスポート (編集画面のみ)
+  const exportSection: HTMLElement[] = [];
+  if (opts.existing) {
+    const historyCheck = el("input", { type: "checkbox" });
+    const exportBtn = el("button", {
+      class: "btn",
+      text: "ファイルに書き出す",
+      onClick: async () => {
+        const persona = opts.existing!.persona;
+        const path = await saveFileDialog({
+          defaultPath: `${persona.name}.personacle.json`,
+          filters: [{ name: "Personacle ペルソナ", extensions: ["json"] }],
+        });
+        if (!path) return;
+        try {
+          const summary = await api.exportPersona(persona.id, historyCheck.checked, path);
+          toast(
+            `エクスポートしました (記憶 ${summary.memoryCount} 件` +
+              (historyCheck.checked ? `、会話 ${summary.sessionCount} 件)` : ")"),
+          );
+        } catch (e) {
+          toast(errorMessage(e), "error");
+        }
+      },
+    });
+    exportSection.push(
+      el("h3", { class: "form-subhead", text: "エクスポート" }),
+      el("p", { class: "muted", text: "初期設定・人格・記憶をファイルに書き出し、別のPCの Personacle に取り込めます" }),
+      el("div", { class: "auto-row" }, [
+        el("label", { class: "toggle-label" }, [historyCheck, "会話履歴も含める"]),
+        exportBtn,
+      ]),
+    );
+  }
+
   return el("div", { class: "form" }, [
     el("h2", { text: opts.existing ? "ペルソナの編集" : "新しいペルソナ" }),
     el("label", { class: "field-label", text: "名前 (必須)" }),
@@ -146,5 +182,6 @@ export function personaFormView(opts: PersonaFormOptions): HTMLElement {
       ? [el("label", { class: "field-label", text: "性格の初期値" }), suggestBtn, ...sliderRows]
       : []),
     el("div", { class: "form-buttons" }, buttons),
+    ...exportSection,
   ]);
 }

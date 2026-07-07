@@ -50,6 +50,15 @@ export const api = {
   getPersonalityHistory: (personaId: string) =>
     invoke<PersonalityEvent[]>("get_personality_history", { personaId }),
 
+  exportPersona: (personaId: string, includeHistory: boolean, path: string) =>
+    invoke<{ memoryCount: number; sessionCount: number }>("export_persona", {
+      personaId,
+      includeHistory,
+      path,
+    }),
+  importPersona: (path: string, force: boolean) =>
+    invoke<Persona>("import_persona", { path, force }),
+
   getSettings: () => invoke<Settings>("get_settings"),
   updateSettings: (settings: Settings) => invoke<void>("update_settings", { settings }),
   testConnection: () => invoke<ConnectionTestResult>("test_connection"),

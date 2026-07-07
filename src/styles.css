@@ -313,6 +313,14 @@ body {
   margin-top: 20px;
 }
 
+.form-subhead {
+  font-size: 14px;
+  color: var(--text-muted);
+  margin: 28px 0 4px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
 .btn {
   padding: 9px 18px;
   background: var(--bg-hover);

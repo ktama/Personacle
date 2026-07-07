@@ -316,6 +316,23 @@ pub fn get_personality_history(
     state.ctx.db.personality_events_of(&persona_id)
 }
 
+// ---------- エクスポート/インポート (FR-18) ----------
+
+#[tauri::command]
+pub fn export_persona(
+    state: State<AppState>,
+    persona_id: String,
+    include_history: bool,
+    path: String,
+) -> AppResult<crate::export::ExportSummary> {
+    crate::export::export_to_file(&state.ctx, &persona_id, include_history, &path)
+}
+
+#[tauri::command]
+pub fn import_persona(state: State<AppState>, path: String, force: bool) -> AppResult<Persona> {
+    crate::export::import_from_file(&state.ctx, &path, force)
+}
+
 // ---------- 設定・接続 (FR-16) ----------
 
 #[tauri::command]

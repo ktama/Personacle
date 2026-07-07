@@ -139,6 +139,65 @@
 - 性格軸デルタを相手ごとに適用すると FR-12 の上限を超えるため「セッションあたり1回のみ適用」とする。
   分類: 実装の自由範囲 (FR-12 の上限保証を優先する解釈)。ADR-08 に明記
 
+---
+
+## FR-18: ペルソナのエクスポート/インポート (2026-07-08 着手)
+
+ベースライン: `cargo test` 51 passed / `npm run build` 成功 (FR-19 完了時点で確認済み)
+
+### 実装内の判断 (設計トレーサビリティ表 FR-18 行が委ねた詳細)
+
+- ファイル形式: JSON 1ファイル。`format: "personacle-persona"` + `formatVersion: 1` + `appSchemaVersion` を記録
+- **埋め込みベクトルは書き出さない**。インポート時に NULL とし Reembed ジョブで再計算
+  (移行先の埋め込みモデルが異なる可能性があり、含めても互換性がないため)
+- ID はインポート時に全て新規発行し、旧ID→新IDのマップで参照(記憶の出所セッション、発話者)を張り替える
+- 会話履歴を含めた場合、インポートされたセッションは status=processed・参加者処理済みとして取り込む
+  (後処理の再実行で記憶が二重生成されるのを防ぐ)
+- 履歴に含まれる「他ペルソナ」への参照は名前スナップショットで保持 (EC-07 の削除済み表示と同じ扱い)
+- 同名ペルソナが既存なら EC-04 と同様に duplicate_name 警告 → force で取込
+- ファイルダイアログは tauri-plugin-dialog (公式プラグイン) を追加して使う
+
+### ステップ (FR-18)
+
+- [ ] G1: export.rs 新設 — ExportFile 構造体 (serde)、build_export / import_value /
+      export_to_file / import_from_file。テスト: 履歴あり/なしラウンドトリップ、同名警告→force、
+      不正形式・未来バージョン拒否、Reembed ジョブ投入、ファイル経由ラウンドトリップ
+      検証: `cargo test export`
+- [ ] G2: コマンド追加 (export_persona / import_persona) + tauri-plugin-dialog の Rust/JS 依存・
+      capability 追加 + lib.rs 配線
+      検証: `cargo test` (全件) — コマンドは薄いラッパのため既存+G1 テストで担保
+- [ ] G3: フロント — ペルソナ編集タブにエクスポート(履歴含む/含まないの選択付き)、
+      サイドバーにインポート。duplicate_name は確認→force 再送
+      検証: `npm run build`
+- [ ] G4: docs/design.md — ADR-09 (エクスポート形式と埋め込み除外) 追記、FR-18 トレーサビリティ更新、
+      6.1 コマンド表に2行追加。README に共有機能の記載
+      検証: 目視
+- [ ] G5: 全テスト + diff 通読
+      検証: `cargo test` 全件 / `npm run build`
+
+### 受け入れ基準→テスト対応 (FR-18)
+
+| 基準 | テスト |
+| --- | --- |
+| エクスポート→別環境でインポートで初期設定・人格・記憶が再現 | export::roundtrip_via_file (別DBの ctx へ取込) |
+| 会話履歴を含むかは選択可 | export::roundtrip_without_history / roundtrip_with_history |
+
+### 進捗記録 (FR-18)
+
+- G1 完了: export.rs (ExportFile/build_export/import_value/ファイルIO)。`cargo test export` → 5 passed
+  (履歴あり/なしラウンドトリップ、同名→force、不正形式・未来バージョン・壊れたファイル拒否、ファイル経由)
+- G2 完了: export_persona/import_persona コマンド、tauri-plugin-dialog (Rust/JS/capability)、lib.rs 配線。
+  `cargo test` → 56 passed
+- G3 完了: 編集タブにエクスポート(履歴含む選択付き)、サイドバーに「ファイルから取り込む」。
+  `npm run build` 成功。修正1回: dialog の save import がフォーム内ローカル関数 save と衝突 → saveFileDialog に改名
+- G4 完了: design.md v1.2 (ADR-09、6.1 コマンド表、FR-18 トレーサビリティ)、README 機能追記+lint修正
+- G5 完了 (2026-07-08): `cargo test` **56 passed / 0 failed**、`npm run build` 成功。
+  diff 通読: 変更15ファイル+新規1、すべて G1〜G4 に対応
+
+### 逸脱記録 (FR-18)
+
+(なし。ADR-09 の判断は「実装内の判断」節のとおり設計が委ねた詳細の範囲)
+
 ## GUI手動確認項目 (npm run tauri dev で確認)
 
 - FR-01/02 作成画面と一覧表示、FR-05 逐次表示の見た目、EC-01 オンボーディング表示

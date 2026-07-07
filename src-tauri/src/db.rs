@@ -6,6 +6,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 
+/// DB スキーマのバージョン (PRAGMA user_version で管理。設計5.3)
+pub const SCHEMA_VERSION: i64 = 1;
+
 /// SQLite 単一コネクション (ADR-07)。シングルユーザーのため Mutex 直列化で足りる。
 pub struct Db {
     conn: Mutex<Connection>,
@@ -111,9 +114,9 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // schema_version は PRAGMA user_version で管理 (設計5.3)
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 1 {
+        if version < SCHEMA_VERSION {
             conn.execute_batch(SCHEMA_V1)?;
-            conn.pragma_update(None, "user_version", 1)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         Ok(Db { conn: Mutex::new(conn) })
     }

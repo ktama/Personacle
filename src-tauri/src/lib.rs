@@ -3,6 +3,7 @@ pub mod context;
 pub mod conversation;
 pub mod db;
 pub mod error;
+pub mod export;
 pub mod inference;
 pub mod memory;
 pub mod models;
@@ -54,6 +55,7 @@ fn cleanup_old_logs(dir: &std::path::Path) {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -117,6 +119,8 @@ pub fn run() {
             commands::update_memory,
             commands::delete_memory,
             commands::get_personality_history,
+            commands::export_persona,
+            commands::import_persona,
             commands::get_settings,
             commands::update_settings,
             commands::test_connection,
