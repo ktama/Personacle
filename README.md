@@ -28,9 +28,12 @@
 2. モデルを取得する (ターミナルで実行):
 
    ```sh
-   ollama pull gemma3          # チャット用 (お好みのモデルでよい)
+   ollama pull gemma4            # チャット用 (推奨: 8B。日本語の口調維持と速度のバランスが良い)
    ollama pull nomic-embed-text  # 記憶の想起用 (推奨)
    ```
+
+   メモリに余裕がある環境 (24GB以上) では、チャット用に `gpt-oss:20b` も選べます
+   (記憶の抽出がより網羅的になる一方、日本語の口調がやや硬く、ロードに時間がかかります)。
 
 ### 2. Personacle を起動する
 
@@ -72,6 +75,10 @@ npm run tauri build
 - コア (Rust): `src-tauri/src/` — `cargo test` で単体テスト実行
 - フロントエンド (TypeScript): `src/` — `npm run build` で検証
 - Ollama 実機統合テスト: `cd src-tauri && cargo test --lib real_ollama -- --ignored --nocapture`
+
+## ライセンス
+
+MIT License ([LICENSE](LICENSE))。依存ソフトウェアのライセンスは [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) と [docs/licensing.md](docs/licensing.md) を参照。
 
 ## アーキテクチャ概要
 

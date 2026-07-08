@@ -17,6 +17,9 @@ pub mod test_util;
 #[cfg(test)]
 mod integration_test;
 
+#[cfg(test)]
+mod poc_test;
+
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager};

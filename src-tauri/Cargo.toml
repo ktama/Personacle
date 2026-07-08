@@ -3,6 +3,7 @@ name = "personacle"
 version = "0.1.0"
 description = "記憶と成長する人格を持つローカルAIキャラクター育成アプリ"
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "personacle_lib"
