@@ -97,6 +97,12 @@ async fn poc_model_bench() {
     }
     println!("[速度中央値] 初トークン {:.1}秒 / 全体 {:.1}秒 (NFR-01基準: 10秒/60秒)", median(firsts.clone()), median(totals.clone()));
 
+    // 速度のみモード (CPU計測など時間のかかる環境用)
+    if std::env::var("PERSONACLE_POC_SPEED_ONLY").is_ok() {
+        println!("===== PoC 完了 (速度のみ): {model} =====\n");
+        return;
+    }
+
     // 2) 知らないことへの正直さ (FR-09 受け入れ基準の簡易版): 5回試行
     let honest_markers = ["知らない", "知りません", "覚えてい", "分かりません", "わかりません", "伺ってい", "聞いてい", "存じ"];
     let mut honest = 0;

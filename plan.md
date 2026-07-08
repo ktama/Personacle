@@ -237,6 +237,34 @@
 
 留意: 本機は AMD GPU 環境。要件9-3 (GPUなし16GB での NFR-01 実測) は未検証のまま残る
 
+## 残件対応 (2026-07-08 着手)
+
+### H1: thinking対応モデルの空応答対策
+
+- 事象: 思考トークンが max_tokens を使い切ると本文が空になる (PoC で再現)
+- 対処: (a) conversation.rs の応答 max_tokens 512→2048、suggest_traits 256→1024
+  (b) 完了したのに本文が空の応答は GenerationError として扱い、空発話を保存しない
+  (キャンセルによる空は従来どおり保存 = FR-07 の途中保存を維持)
+- 検証: 空応答モックのテスト追加 + `cargo test` 全件
+
+### H2: 要件9-3 (GPUなし環境の性能実測)
+
+- 本機はAMD GPUありのため、`num_gpu 0` のCPU専用モデル (gemma4-cpu) を作って近似実測する
+- poc_test.rs に速度のみモード (PERSONACLE_POC_SPEED_ONLY) を追加
+- 結果をもとに要件9-3 (推奨動作環境) の結論を出し、requirements の未解決表を整理
+
+### H1/H2 結果 (2026-07-08)
+
+- H1 完了: max_tokens 512→2048 (応答) / 256→1024 (性格評定)、完了時空応答は GenerationError 化。
+  `cargo test` → **57 passed** (+1: empty_completion_treated_as_failure)
+- H2 完了: gemma4 の CPU 専用実測 (Ryzen 7 9700X, 32GB, num_gpu=0):
+  - ロード+初回応答 34.8秒 / 初トークン中央値 **1.3秒** / 全体中央値 **4.2秒**
+  - ばらつき: 3回目のみ初トークン17.8秒 (プロンプト再処理と推測)。それでも全体60秒基準内
+  - 結論: **GPUなしでも NFR-01 (中央値10秒/60秒) を満たす** → 要件9-3 の推奨環境
+    「メモリ16GB以上・GPU必須としない」を維持できる。ただし本機のCPUは高性能帯であり、
+    低速CPUでは初回ロードと揺らぎが大きくなる点を README に注記
+  - 計測後、gemma4-cpu と Modelfile は削除済み
+
 ### 発見事項 (D-1 計測中)
 
 - **thinking対応モデル(gemma4等)では max_tokens が思考トークンに食われ、本文が空になることがある**。

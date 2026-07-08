@@ -225,7 +225,8 @@ async fn generate_reply(ctx: &AppCtx, session: &Session, speaker: &Persona) -> A
         model: settings.chat_model.clone(),
         messages,
         temperature: 0.8,
-        max_tokens: Some(512),
+        // thinking対応モデルは思考にもトークンを使うため、少なすぎると本文が空になる
+        max_tokens: Some(2048),
     };
     let sink = ctx.sink.clone();
     let uid = utterance_id.clone();
@@ -254,6 +255,19 @@ async fn generate_reply(ctx: &AppCtx, session: &Session, speaker: &Persona) -> A
             });
         }
     };
+
+    // 完了したのに本文が空 (thinking がトークンを使い切った等) は生成失敗として扱う
+    if !outcome.canceled && outcome.text.trim().is_empty() {
+        ctx.sink.emit(
+            "generation_failed",
+            json!({
+                "sessionId": session.id,
+                "kind": "generation",
+                "message": "応答が空でした。モデルの思考がトークン上限を使い切った可能性があります。もう一度送信してください",
+            }),
+        );
+        return Err(AppError::Generation("応答が空でした".into()));
+    }
 
     // FR-07: キャンセル時も途中までの本文で保存する
     let state = if outcome.canceled { "canceled" } else { "complete" };
@@ -382,6 +396,22 @@ mod tests {
         // 途中までの本文が残る
         assert!(!reply.content.is_empty());
         assert!(reply.content.chars().count() < "これはとても長い応答でキャンセルされる予定のもの".chars().count());
+    }
+
+    /// thinking対応モデル対策: 完了したのに本文が空の応答は失敗として扱い、空発話を残さない
+    #[tokio::test]
+    async fn empty_completion_treated_as_failure() {
+        let env = test_ctx(MockInference::with_replies(&[""]));
+        let a = add_persona(&env.ctx, "アリス");
+        let s = start_session(&env.ctx, "user_dialogue", &[a.id.clone()], "").unwrap();
+
+        let err = send_user_message(&env.ctx, &s.id, "やあ").await.unwrap_err();
+        assert_eq!(err.kind(), "generation");
+        assert!(env.sink.names().contains(&"generation_failed".to_string()));
+        // ユーザー発話のみ保存され、空のペルソナ発話は残らない
+        let utts = env.ctx.db.utterances_of(&s.id).unwrap();
+        assert_eq!(utts.len(), 1);
+        assert_eq!(utts[0].speaker_kind, "user");
     }
 
     #[tokio::test]

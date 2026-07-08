@@ -32,16 +32,22 @@
 ## リリース時のチェックリスト
 
 1. `npm run tauri build` で NSIS/MSI を生成 (インストーラに LICENSE が表示される設定済み)
-2. サードパーティライセンスの**本文**を生成して同梱する:
+   — **v0.1.0 実施済み (2026-07-08)**: `src-tauri/target/release/bundle/` に
+   `nsis/Personacle_0.1.0_x64-setup.exe` (3.7MB) と `msi/Personacle_0.1.0_x64_en-US.msi` (5.3MB)
+2. サードパーティライセンスの**本文**を生成して同梱する — **v0.1.0 実施済み**:
 
    ```sh
-   cargo install cargo-about
+   cargo install cargo-about --features cli   # 初回のみ (cli フィーチャー必須)
    cd src-tauri
-   cargo about init          # 初回のみ (about.toml が生成される)
-   cargo about generate about.hbs > ../THIRD_PARTY_LICENSES.html
+   cargo about init                           # 初回のみ (about.toml / about.hbs)
+   cargo about generate about.hbs -o ../THIRD_PARTY_LICENSES.html
    ```
 
-   (THIRD_PARTY_LICENSES.md は一覧のみ。配布時は本文付きの生成物を推奨)
-3. GitHub Releases にインストーラと THIRD_PARTY_LICENSES を添付
+   about.toml (許容ライセンス一覧) はリポジトリ管理。生成物 THIRD_PARTY_LICENSES.html は
+   リリースごとに再生成して Releases に添付する (git 管理外)。
+   THIRD_PARTY_LICENSES.md は一覧のみの参照用
+3. GitHub Releases にインストーラと THIRD_PARTY_LICENSES.html を添付
+   — **自動化済み (2026-07-08)**: `v*` タグの push で .github/workflows/release.yml が
+   ビルド〜ドラフトリリース作成〜添付まで実行する。公開はドラフトを確認してから手動で行う
 4. コード署名は未実施のため、初回起動時に SmartScreen 警告が出る旨を Release ノートに記載する
-   (署名証明書の導入はダウンロード数が伸びてから再検討)
+   (署名証明書の導入はダウンロード数が伸びてから再検討)。ノート下書き: docs/release-notes-v0.1.0.md

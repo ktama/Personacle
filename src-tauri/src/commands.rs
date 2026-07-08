@@ -183,7 +183,8 @@ pub async fn suggest_traits(state: State<'_, AppState>, description: String) -> 
             ChatMessage::new("user", clamp_field(&description, 2000)),
         ],
         temperature: 0.2,
-        max_tokens: Some(256),
+        // thinking対応モデルの思考分の余裕を持たせる
+        max_tokens: Some(1024),
     };
     let text = state.ctx.inference.chat_once(req).await.map_err(|e| AppError::Generation(e.to_string()))?;
     let v = extract_json(&text)
