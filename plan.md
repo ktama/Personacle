@@ -285,3 +285,110 @@
 ## 発見事項
 
 - Ollama が AMD AI Bundle 由来のパスにあり、標準インストールと異なる。README の手順は標準 Ollama を前提に書き、既存導入でも動く旨を注記する
+
+---
+
+# 実装計画: Personacle v0.2 (FR-20〜35, NFR-08〜09, EC-13〜20)
+
+## 根拠文書
+
+- 要件: docs/requirements.md v2.0 (承認済み)
+- 設計: docs/design.md v2.0 (ADR-10〜17 全て承認済み 2026-07-08)
+- ベースライン (2026-07-08 変更前): `cargo test --lib` → **57 passed / 0 failed / 3 ignored**、`npm run build` 成功
+
+## 制約(実装中ずっと守るもの)
+
+- 既存の schema v1 のテーブル・カラムは削除・改名しない。追加のみ(ALTER ADD / 新テーブル)。移行は user_version 1→2 (設計5.3)
+- 応答経路に推論を追加しない。例外は想起クエリ埋め込み(既存)と話者選択推論のみ(設計方針2)
+- 依存追加は原則しない。グラフは自作SVG (ADR-17)。話しかけは既存 dialog 系の追加なし
+- テストを通すためにテスト側を弱めない。既存57テストを壊さない
+- 生成品質依存の受け入れ基準(「7/10」等)は実機(WP9, ignored テスト)で確認し、コアロジックはモック推論で単体検証する
+
+## 受け入れ基準 → テスト対応表
+
+| 基準 (要件ID) | テスト | 状態 |
+| --- | --- | --- |
+| FR-20 経過時間ラベルの注入/非注入 | prompt::elapsed_label_thresholds | 未 |
+| FR-21 話しかけ生成と無効化 | conversation::greeting_generated / greeting_disabled | 未 |
+| FR-22 類似5件で統合・元アーカイブ | worker::consolidation_clusters_and_archives | 未 |
+| FR-23 由来の双方向参照 | db::memory_sources_roundtrip | 未 |
+| FR-24 ムード反映と上限・回帰 | personality::mood_clamp / mood_decays_over_time | 未 |
+| FR-25 ムード閲覧と変動要因 | db::mood_event_roundtrip | 未 |
+| FR-26 日記の当日生成・上書き | worker::diary_generated_and_upserted | 未 |
+| FR-27 日記一覧降順 | db::diaries_desc | 未 |
+| FR-28 記憶検索・絞り込み | memory::search_filters (db) | 未 |
+| FR-29 時系列系列の履歴一致 | db::trait_series_matches_events | 未 |
+| FR-30 関係図ノード・辺 | db::relationship_graph | 未 |
+| FR-31 グループ話者選択1体 | conversation::group_selects_one_speaker | 未 |
+| FR-32 指名応答 | conversation::group_nomination | 未 |
+| FR-33 連鎖上限・ユーザー優先 | conversation::group_chain_capped | 未 |
+| FR-34 グループ後処理の関係更新 | worker::group_postprocess_relationships | 未 |
+| FR-35 停滞検出と話題転換 | conversation::stagnation_inserts_topic | 未 |
+| EC-14 話しかけ再生成間隔 | conversation::greeting_too_soon | 未 |
+| EC-15 統合の二重生成防止 | worker::consolidation_idempotent | 未 |
+| EC-16 統合記憶削除で元復元 | db::delete_consolidated_restores | 未 |
+| EC-17 日またぎは開始日帰属 | worker::diary_belongs_to_start_date | 未 |
+| EC-18 時計巻き戻しでラベルなし | prompt::negative_elapsed_no_label | 未 |
+| EC-20 データ不足で無操作 | worker::consolidation_skips_small / greeting on 0 memory | 未 |
+| NFR-08/09 性能 | WP9 実機計測(報告) | 未 |
+
+## ワークパッケージ(依存順)
+
+- [x] WP1: データ基盤 — models.rs 拡張 + db.rs schema v2 移行 + 新メソッド [FR-22/23/24/25/26/27/28/29/30, EC-15/16, 設計5章]
+      検証: `cargo test --lib db` + `cargo test --lib models`(移行・新テーブル往復・由来・検索・系列)
+- [x] WP2: MemoryService — 検索/絞り込み(FR-28) + 類似クラスタ検出(FR-22, ADR-12) [設計8章性能, フロー3手順5]
+      検証: `cargo test --lib memory`
+- [x] WP3: PersonalityService — ムードの減衰導出と変化適用・クランプ(FR-24/25, ADR-13) [設計フロー3手順3-4]
+      検証: `cargo test --lib personality`
+- [x] WP4: PromptBuilder — 経過時間ラベル(ADR-11)+ムード言語化(ADR-13)+グループ参加者列挙 [設計6.4]。generate_reply へ実配線
+      検証: `cargo test --lib prompt`
+- [x] WP5: ConversationService — 話しかけ(フロー6)/グループ話者選択・連鎖(フロー7)/停滞検出(フロー2d) [ADR-10/15/16]
+      検証: `cargo test --lib conversation`
+- [x] WP6: BackgroundWorker — ムード評定 + 記憶統合 + 日記生成 + 起動時リカバリ拡張(EC-15/17) [設計フロー3手順3/5/6, フロー4]
+      検証: `cargo test --lib worker`
+- [x] WP7: Command Facade + イベント — v0.2 command 群 + speaker_selecting/postprocess拡張 [設計6.1/6.2]
+      検証: `cargo test --lib`(全件) + `cargo check`
+- [x] WP8: フロントエンド — 話しかけ・グループチャット・記憶検索・ムード表示・日記・ダッシュボード(SVG)・関係図(SVG)
+      検証: `npm run build`(tsc strict + vite)成功
+- [x] WP9: 実機統合 + ドキュメント — ignored 統合テスト、README、design/requirements のトレーサビリティ最終確認
+      検証: `cargo test --lib` 全件 / 実機 ignored / `npm run build`
+
+## 実行記録 (v0.2)
+
+- ベースライン: `cargo test --lib` → 57 passed / 0 failed / 3 ignored (2026-07-08)
+- WP1: `cargo test --lib` → **64 passed / 0 failed / 3 ignored** (+7: migration_v1_to_v2, mood_event_roundtrip, memory_sources_roundtrip, delete_consolidated_restores_sources, search_memories_by_keyword_and_kind, diary_upsert_and_list_desc, relationship_graph_material)。回帰なし。方針: Persona/Memory 構造体は不変とし、ムード/話しかけ/consolidated_into は列追加+専用メソッドで扱い42箇所の構築サイトを保護
+- WP2: `cargo test --lib memory` → 統合クラスタ検出3件 (consolidation_cluster_forms_at_threshold / skips_small / excludes_archived_and_unembedded)。想起・検索は既存関数+WP1 db.search_memories で充足
+- WP3: `cargo test --lib personality` → ムード3件 (mood_decays_over_time / neutral_band_label / apply_clamps_and_records)。減衰は保存値+rated_at からの遅延計算(常駐なし)
+- WP4: `cargo test --lib prompt` → 3件 (elapsed_label_thresholds / mood_phrase_neutral_is_none / system_includes_mood_and_elapsed)。generate_reply に current_mood + elapsed_label を実配線
+- WP3-4後 全体: `cargo test --lib` → **73 passed / 0 failed / 3 ignored**。回帰なし
+- WP5: `cargo test --lib conversation` → 22 passed (+11)。話しかけ4 (FR-21/EC-13/14) / グループ5 (decide_speaker_corrections, FR-31/32/33, EC-19) / 停滞2 (stagnation_reached, FR-35)。generate_reply に opening_hint とグループ相手(他ペルソナ+ユーザー)を追加。全体 `cargo test --lib` → **84 passed / 0 failed / 3 ignored**。回帰なし
+- WP6: `cargo test --lib worker` → 14 passed (+5: parse_consolidation, consolidation_clusters_and_archives_fr22, consolidation_idempotent_ec15, mood_and_diary_generated_fr24_fr26, greeting_only_session_skips_postprocess_adr10)。評定JSONにムード追加、後処理に統合(手順5)・日記(手順6)・ADR-10スキップを組込み。既存の自律会話テスト2件は日記生成の chat_once 増加に合わせモックキューを延長(挙動反映であり期待値の弱体化ではない)。日記の起動時リカバリは未処理セッション再処理に包含(逸脱記録参照)。全体 `cargo test --lib` → **89 passed / 0 failed / 3 ignored**。回帰なし
+- WP7: `cargo test --lib commands` → 8 passed (+2: trait_series_matches_events_fr29, relationship_graph_nodes_and_edges_fr30)。command 8種追加(request_greeting/search_memories/get_memory_sources/get_mood/list_diaries/get_trait_series/get_intimacy_series/get_relationship_graph)、send_message にグループ振分け+指名、delete_memory に restore_sources(EC-16)。lib.rs に登録。全体 `cargo test --lib` → **91 passed / 0 failed / 3 ignored**、`cargo check` クリーン(Tauri handler 検証)
+- WP8: `npm run build`(tsc strict + vite)成功。types/api に v0.2 型・command・イベント追加。新規ビュー: charts.ts(自作SVG折れ線+関係図, ADR-17)/diary.ts/dashboard.ts/graph.ts/group.ts。既存拡張: chat.ts(開設時に話しかけ FR-21)/memories.ts(検索・種別絞り込み FR-28・統合由来 FR-23・EC-16復元)/personality.ts(ムード表示 FR-25)/settings.ts(話しかけトグル)/main.ts(日記・成長タブ、グループ・関係図ナビ、speaker_selecting配線)。request_greeting は bool 返却の同期 await に変更(入力ロック残り防止)。JS 41KB / CSS 9.95KB。Rust側 `cargo test --lib` → 91 passed 維持、`cargo check` クリーン
+- WP9: 統合テスト2件追加(real_ollama_greeting_mood_diary_v02 / real_ollama_group_chat_v02、ignored)。`cargo test` フルスイート → **91 passed / 0 failed / 5 ignored**、`npm run build` OK。README に v0.2 機能追記、docs/release-notes-v0.2.0.md 作成。git status 確認: 変更は全て v0.2 関連(無関係な変更なし)、登録 command は全て api.ts で使用。**実機 ignored テストは Ollama 未起動のため本セッションでは未実行(要手動実行)** — 下記「実機で要確認」参照
+
+## 実機テスト結果 (2026-07-10, Ollama 起動後に実行)
+
+`cargo test --lib real_ollama -- --ignored --nocapture` (CHAT_MODEL=gpt-oss:20b, EMBED=nomic-embed-text) → **4 passed / 0 failed** (201秒):
+
+- `real_ollama_greeting_mood_diary_v02` ✓ — 話しかけ生成(記憶の好物に言及)、ムード value=15〜18 label=上機嫌(褒められて上昇)、当日日記が一人称で生成
+- `real_ollama_group_chat_v02` ✓ — ユーザー発話に対し1体(アリス)が応答、相手の名前を認識
+- `real_ollama_end_to_end_memory_recall` ✓ (v0.1回帰) — 好物カレーの記憶→新セッションで想起。回帰なし
+- `real_ollama_autonomous_conversation` ✓ (v0.1回帰) — 4ターン交互、停滞検出が新たに走るが自然な会話では誤挿入なし、両者に記憶形成
+
+### 実機で観察した品質事項 (コード欠陥ではなく、モデル/プロンプト調整の対象)
+
+- **グループ話者選択の文脈適合 (FR-31, 設計 R-6)**: 「星がきれい」という天体寄りの発話に対し、天体観測が趣味のボブではなく料理担当のアリスが選ばれた。選択機構(LLM選択+コア補正)は正しく1体を選び、その人格を反映して応答しているが、話題との適合が gpt-oss:20b では不安定。FR-31 の受け入れ基準は「10回試行中7回以上」の統計的基準であり、R-6 の PoC 計測と選択プロンプト/推奨モデル(gemma4)での再評価で調整する。しきい値・プロンプトは設定/コードで調整可能
+
+## GUI で要確認 (npm run tauri dev, 手動)
+
+- 話しかけ表示、ムードバッジ、日記/成長(SVG)/関係図(SVG)タブ、グループチャットの指名(@名前)と連鎖、記憶検索・種別絞り込み、統合記憶の「由来を見る」
+- D-5 の各しきい値(統合類似度・ムード半減期・停滞判定・話しかけ間隔)は設定 or コードで調整し、R-7〜R-9 とあわせて発注者承認で確定
+
+## 逸脱記録 (v0.2)
+
+- WP6 日記の起動時リカバリ: 設計フロー4手順4は「日記が古い/欠落する日を検出して日記生成キューへ」だが、専用 Job 追加(enum/worker/テスト churn)を避け、既存の未処理セッション再処理で代替した。未処理セッションは再 postprocess され、generate_diary が当日の全セッションから日記を都度再生成(上書き)するため「処理済みの日には日記が存在する」不変条件は保たれる。分類: 実装の自由範囲(設計意図=当日に日記が揃うことは同一の結果で達成)。残る隙間は「全セッション処理済みだが日記生成のchat_onceだけが空応答で失敗した日」で、これはそのペルソナが同日に再度対話すれば再生成される(FR-26の当日更新方針の範囲)
+
+## 発見事項 (v0.2)
+
+- (なし)

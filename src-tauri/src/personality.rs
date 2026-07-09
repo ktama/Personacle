@@ -1,6 +1,9 @@
 use crate::db::Db;
 use crate::error::AppResult;
-use crate::models::{new_id, PersonalityEvent, Relationship, Settings};
+use crate::models::{
+    new_id, MoodEvent, MoodState, PersonalityEvent, Relationship, Settings, MOOD_MAX, MOOD_MIN,
+    MOOD_NEUTRAL_BAND,
+};
 
 /// 性格軸 (設計5.2 初期案・要件9-4のプロトタイプ検証対象)
 pub const TRAIT_KEYS: [&str; 5] = ["sociability", "empathy", "caution", "assertiveness", "cheerfulness"];
@@ -34,6 +37,73 @@ pub fn clamp_value(v: i64) -> i64 {
 pub struct PartnerAssessment {
     pub intimacy_delta: i64,
     pub impression: Option<String>,
+}
+
+// ---------- ムード (v0.2, ADR-13) ----------
+
+/// 保存値から現在ムードを半減期で減衰導出する (ADR-13)。
+/// 経過が負(時計巻き戻し)なら経過0扱いで値を変えない。
+pub fn derive_mood(value: i64, rated_at: Option<i64>, now_ms: i64, halflife_hours: i64) -> i64 {
+    let Some(rated) = rated_at else { return 0 };
+    if value == 0 || halflife_hours <= 0 {
+        return value;
+    }
+    let elapsed_h = ((now_ms - rated).max(0) as f64) / 3_600_000.0;
+    let factor = 0.5f64.powf(elapsed_h / halflife_hours as f64);
+    (value as f64 * factor).round() as i64
+}
+
+/// |value| が平常バンド未満なら「平常」、それ以外は保存ラベルを返す (ADR-13)
+pub fn mood_label_for(value: i64, stored_label: &str) -> String {
+    if value.abs() < MOOD_NEUTRAL_BAND {
+        "平常".to_string()
+    } else {
+        stored_label.to_string()
+    }
+}
+
+/// 減衰計算済みの現在ムードと直近の変動要因を返す (FR-25)
+pub fn current_mood(db: &Db, persona_id: &str, settings: &Settings, now_ms: i64) -> AppResult<MoodState> {
+    let (value, label, rated_at) = db.get_mood_raw(persona_id)?;
+    let derived = derive_mood(value, rated_at, now_ms, settings.mood_halflife_hours);
+    let eff_label = mood_label_for(derived, &label);
+    let recent = db.mood_events_of(persona_id)?.into_iter().next();
+    Ok(MoodState { value: derived, label: eff_label, rated_at, recent_event: recent })
+}
+
+/// ムードのデルタを上限付きで適用する (FR-24, ADR-13)。
+/// 現在の減衰後の値に対してデルタを加え、[-100,100] にクランプして保存する。
+/// 変化があれば mood_event を追記して返す。人格(trait/relationship)には一切触れない。
+pub fn apply_mood(
+    db: &Db,
+    persona_id: &str,
+    session_id: &str,
+    raw_delta: i64,
+    label: &str,
+    settings: &Settings,
+    now_ms: i64,
+) -> AppResult<Option<MoodEvent>> {
+    let (stored, _stored_label, rated_at) = db.get_mood_raw(persona_id)?;
+    let old = derive_mood(stored, rated_at, now_ms, settings.mood_halflife_hours);
+    let delta = clamp_delta(raw_delta, settings.mood_delta_cap);
+    let new = (old + delta).clamp(MOOD_MIN, MOOD_MAX);
+    let eff_label: String = label.trim().chars().take(20).collect();
+    // rated_at を now に更新し、以後の減衰の基準にする(平常ラベルは読み出し時に導出)
+    db.set_mood(persona_id, new, &eff_label, now_ms)?;
+    if new == old {
+        return Ok(None);
+    }
+    let e = MoodEvent {
+        id: new_id(),
+        persona_id: persona_id.to_string(),
+        session_id: Some(session_id.to_string()),
+        old_value: old,
+        new_value: new,
+        label: eff_label,
+        created_at: now_ms,
+    };
+    db.insert_mood_event(&e)?;
+    Ok(Some(e))
 }
 
 /// 性格軸デルタを上限付きで適用し、変化をイベントとして追記する (FR-12/13)
@@ -232,5 +302,49 @@ mod tests {
         let rel = db.get_relationship(&p.id, "user", "user").unwrap().unwrap();
         assert_eq!(rel.intimacy, DEFAULT_INTIMACY + 30);
         assert!(rel.intimacy > DEFAULT_INTIMACY);
+    }
+
+    #[test]
+    fn mood_decays_over_time() {
+        // FR-24/ADR-13: 半減期で平常へ回帰する
+        let now = now_ms();
+        let hl = 24;
+        assert_eq!(derive_mood(80, Some(now), now, hl), 80); // 直後は変化なし
+        assert_eq!(derive_mood(80, Some(now - 24 * 3_600_000), now, hl), 40); // 24h で半減
+        assert_eq!(derive_mood(80, Some(now - 48 * 3_600_000), now, hl), 20); // 48h で 1/4
+        // 時計巻き戻し(now < rated)でも値は変わらない
+        assert_eq!(derive_mood(80, Some(now + 3_600_000), now, hl), 80);
+        // 評定なしは平常(0)
+        assert_eq!(derive_mood(80, None, now, hl), 0);
+    }
+
+    #[test]
+    fn mood_neutral_band_label() {
+        assert_eq!(mood_label_for(5, "上機嫌"), "平常");
+        assert_eq!(mood_label_for(-5, "不機嫌"), "平常");
+        assert_eq!(mood_label_for(40, "上機嫌"), "上機嫌");
+    }
+
+    #[test]
+    fn mood_apply_clamps_and_records() {
+        // FR-24: 1セッションの変化量上限、値域クランプ、変動要因の記録
+        let (_d, db, p) = test_env();
+        let s = Settings::default(); // mood_delta_cap = 50, halflife 24
+        let now = now_ms();
+        // +100 要求 → +50 にクランプ (0 → 50)
+        let e = apply_mood(&db, &p.id, "s1", 100, "上機嫌", &s, now).unwrap().unwrap();
+        assert_eq!(e.old_value, 0);
+        assert_eq!(e.new_value, 50);
+        let m = current_mood(&db, &p.id, &s, now).unwrap();
+        assert_eq!(m.value, 50);
+        assert_eq!(m.label, "上機嫌");
+        // さらに +50 → 100 上限でクランプ (50 → 100)
+        let e2 = apply_mood(&db, &p.id, "s2", 50, "大喜び", &s, now).unwrap().unwrap();
+        assert_eq!(e2.new_value, 100);
+        // ムードは性格・親密度を変えない (FR-24 構造保証の確認)
+        assert_eq!(db.traits_of(&p.id).unwrap()[0].value, 50);
+        assert!(db.get_relationship(&p.id, "user", "user").unwrap().is_none());
+        // 変動要因が2件記録される
+        assert_eq!(db.mood_events_of(&p.id).unwrap().len(), 2);
     }
 }

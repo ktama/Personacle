@@ -2,16 +2,21 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionTestResult,
+  Diary,
   GenerationFailedPayload,
   Memory,
+  MoodState,
   Persona,
   PersonaDetail,
   PersonaInput,
   PersonalityEvent,
   PostprocessCompletedPayload,
+  RelationshipGraph,
+  Series,
   Session,
   SessionStatusPayload,
   Settings,
+  SpeakerSelectingPayload,
   TraitValue,
   Utterance,
   UtteranceCompletedPayload,
@@ -31,8 +36,9 @@ export const api = {
 
   startSession: (kind: string, personaIds: string[], theme?: string) =>
     invoke<Session>("start_session", { kind, personaIds, theme: theme ?? "" }),
-  sendMessage: (sessionId: string, text: string) =>
-    invoke<Utterance>("send_message", { sessionId, text }),
+  sendMessage: (sessionId: string, text: string, targetPersonaId?: string) =>
+    invoke<Utterance>("send_message", { sessionId, text, targetPersonaId: targetPersonaId ?? null }),
+  requestGreeting: (sessionId: string) => invoke<boolean>("request_greeting", { sessionId }),
   cancelGeneration: (sessionId: string) => invoke<void>("cancel_generation", { sessionId }),
   endSession: (sessionId: string) => invoke<void>("end_session", { sessionId }),
   startAutonomousTurns: (sessionId: string) =>
@@ -44,11 +50,21 @@ export const api = {
 
   listMemories: (personaId: string, includeArchived: boolean) =>
     invoke<Memory[]>("list_memories", { personaId, includeArchived }),
+  searchMemories: (personaId: string, query: string, kinds: string[], includeArchived: boolean) =>
+    invoke<Memory[]>("search_memories", { personaId, query, kinds, includeArchived }),
+  getMemorySources: (memoryId: string) => invoke<Memory[]>("get_memory_sources", { memoryId }),
   updateMemory: (id: string, content: string) => invoke<void>("update_memory", { id, content }),
-  deleteMemory: (id: string) => invoke<void>("delete_memory", { id }),
+  deleteMemory: (id: string, restoreSources?: boolean) =>
+    invoke<void>("delete_memory", { id, restoreSources: restoreSources ?? false }),
 
   getPersonalityHistory: (personaId: string) =>
     invoke<PersonalityEvent[]>("get_personality_history", { personaId }),
+  getMood: (personaId: string) => invoke<MoodState>("get_mood", { personaId }),
+  listDiaries: (personaId: string) => invoke<Diary[]>("list_diaries", { personaId }),
+  getTraitSeries: (personaId: string) => invoke<Series[]>("get_trait_series", { personaId }),
+  getIntimacySeries: (personaId: string, targetName: string) =>
+    invoke<Series>("get_intimacy_series", { personaId, targetName }),
+  getRelationshipGraph: () => invoke<RelationshipGraph>("get_relationship_graph"),
 
   exportPersona: (personaId: string, includeHistory: boolean, path: string) =>
     invoke<{ memoryCount: number; sessionCount: number }>("export_persona", {
@@ -73,6 +89,7 @@ export interface EventHandlers {
   onGenerationFailed?: (p: GenerationFailedPayload) => void;
   onSessionStatusChanged?: (p: SessionStatusPayload) => void;
   onPostprocessCompleted?: (p: PostprocessCompletedPayload) => void;
+  onSpeakerSelecting?: (p: SpeakerSelectingPayload) => void;
 }
 
 export async function subscribeEvents(h: EventHandlers): Promise<UnlistenFn> {
@@ -89,5 +106,7 @@ export async function subscribeEvents(h: EventHandlers): Promise<UnlistenFn> {
     unlisteners.push(await listen("session_status_changed", (e) => h.onSessionStatusChanged!(e.payload as SessionStatusPayload)));
   if (h.onPostprocessCompleted)
     unlisteners.push(await listen("postprocess_completed", (e) => h.onPostprocessCompleted!(e.payload as PostprocessCompletedPayload)));
+  if (h.onSpeakerSelecting)
+    unlisteners.push(await listen("speaker_selecting", (e) => h.onSpeakerSelecting!(e.payload as SpeakerSelectingPayload)));
   return () => unlisteners.forEach((u) => u());
 }

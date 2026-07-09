@@ -34,7 +34,7 @@ export interface PersonaDetail {
 
 export interface Session {
   id: string;
-  kind: "user_dialogue" | "autonomous";
+  kind: "user_dialogue" | "autonomous" | "group";
   theme: string;
   status: "active" | "ended" | "processed";
   startedAt: number;
@@ -46,12 +46,65 @@ export interface Session {
 export interface Utterance {
   id: string;
   sessionId: string;
-  speakerKind: "user" | "persona";
+  speakerKind: "user" | "persona" | "system";
   speakerId: string;
   speakerName: string;
   content: string;
   state: "complete" | "canceled";
   createdAt: number;
+}
+
+// v0.2
+export interface MoodEvent {
+  id: string;
+  personaId: string;
+  sessionId: string | null;
+  oldValue: number;
+  newValue: number;
+  label: string;
+  createdAt: number;
+}
+
+export interface MoodState {
+  value: number;
+  label: string;
+  ratedAt: number | null;
+  recentEvent: MoodEvent | null;
+}
+
+export interface Diary {
+  id: string;
+  personaId: string;
+  date: string;
+  content: string;
+  updatedAt: number;
+}
+
+export interface SeriesPoint {
+  t: number;
+  value: number;
+}
+
+export interface Series {
+  key: string;
+  points: SeriesPoint[];
+}
+
+export interface GraphNode {
+  id: string;
+  name: string;
+  kind: "user" | "persona";
+}
+
+export interface GraphEdge {
+  from: string;
+  to: string;
+  intimacy: number;
+}
+
+export interface RelationshipGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
 }
 
 export interface Memory {
@@ -91,6 +144,21 @@ export interface Settings {
   intimacyDeltaCap: number;
   memoryCap: number;
   contextChars: number;
+  // v0.2
+  greetingEnabled: boolean;
+  greetingIntervalMin: number;
+  elapsedShortHours: number;
+  elapsedMidHours: number;
+  elapsedLongDays: number;
+  consolidateSim: number;
+  consolidateMinCluster: number;
+  moodHalflifeHours: number;
+  moodDeltaCap: number;
+  chainLimit: number;
+  groupMax: number;
+  stagnationSim: number;
+  stagnationStreak: number;
+  topicShiftLimit: number;
 }
 
 export interface ConnectionTestResult {
@@ -153,6 +221,11 @@ export interface PostprocessCompletedPayload {
   sessionId: string;
   memoryCount: number;
   eventCount: number;
+  consolidatedCount: number;
+  diaryUpdated: boolean;
+}
+export interface SpeakerSelectingPayload {
+  sessionId: string;
 }
 
 export const TRAIT_LABELS: Record<string, string> = {

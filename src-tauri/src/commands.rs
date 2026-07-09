@@ -212,9 +212,21 @@ pub fn start_session(
 }
 
 #[tauri::command]
-pub fn send_message(state: State<AppState>, session_id: String, text: String) -> AppResult<Utterance> {
+pub fn send_message(
+    state: State<AppState>,
+    session_id: String,
+    text: String,
+    target_persona_id: Option<String>,
+) -> AppResult<Utterance> {
     let settings = state.ctx.db.load_settings()?;
     let cleaned = validate_message(&text, settings.input_max_chars)?;
+    // セッション種別で1対1/グループを振り分ける (FR-31/32)
+    let is_group = state
+        .ctx
+        .db
+        .get_session(&session_id)?
+        .map(|s| s.kind == "group")
+        .unwrap_or(false);
     // 応答生成は非同期に行い、結果はイベントで届く (設計6.1)
     let ctx = state.ctx.clone();
     let sid = session_id.clone();
@@ -229,9 +241,13 @@ pub fn send_message(state: State<AppState>, session_id: String, text: String) ->
         created_at: now_ms(),
     };
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = conversation::send_user_message(&ctx, &sid, &cleaned).await {
-            // 推論エラーは send_user_message 内で generation_failed を発行済み。
-            // それ以外 (検証・データ) もここで通知する
+        let result = if is_group {
+            conversation::send_group_message(&ctx, &sid, &cleaned, target_persona_id.as_deref()).await
+        } else {
+            conversation::send_user_message(&ctx, &sid, &cleaned).await
+        };
+        if let Err(e) = result {
+            // 推論エラーは生成側で generation_failed を発行済み。それ以外もここで通知する
             if !matches!(e, AppError::Connection(_) | AppError::Generation(_)) {
                 ctx.sink.emit(
                     "generation_failed",
@@ -241,6 +257,13 @@ pub fn send_message(state: State<AppState>, session_id: String, text: String) ->
         }
     });
     Ok(preview)
+}
+
+/// 話しかけの要求 (FR-21)。発話はイベントで逐次届き、生成したかどうかを返す。
+/// 生成可否(無効/間隔内/接続失敗)は内部で判定する (EC-13/14)。
+#[tauri::command]
+pub async fn request_greeting(state: State<'_, AppState>, session_id: String) -> AppResult<bool> {
+    conversation::request_greeting(&state.ctx, &session_id).await
 }
 
 #[tauri::command]
@@ -303,11 +326,35 @@ pub fn update_memory(state: State<AppState>, id: String, content: String) -> App
 }
 
 #[tauri::command]
-pub fn delete_memory(state: State<AppState>, id: String) -> AppResult<()> {
+pub fn delete_memory(state: State<AppState>, id: String, restore_sources: Option<bool>) -> AppResult<()> {
+    // EC-16: 統合記憶の削除時、元記憶を想起対象へ戻すか選べる
+    if restore_sources.unwrap_or(false) {
+        state.ctx.db.restore_consolidated_sources(&id)?;
+    }
     state.ctx.db.delete_memory(&id)
 }
 
-// ---------- 人格 (FR-13) ----------
+// ---------- 記憶の検索・統合の由来 (v0.2, FR-28/23) ----------
+
+#[tauri::command]
+pub fn search_memories(
+    state: State<AppState>,
+    persona_id: String,
+    query: Option<String>,
+    kinds: Option<Vec<String>>,
+    include_archived: bool,
+) -> AppResult<Vec<Memory>> {
+    let q = query.unwrap_or_default();
+    let k = kinds.unwrap_or_default();
+    state.ctx.db.search_memories(&persona_id, &q, &k, include_archived)
+}
+
+#[tauri::command]
+pub fn get_memory_sources(state: State<AppState>, memory_id: String) -> AppResult<Vec<Memory>> {
+    state.ctx.db.memory_sources(&memory_id)
+}
+
+// ---------- 人格・ムード (FR-13/25) ----------
 
 #[tauri::command]
 pub fn get_personality_history(
@@ -315,6 +362,95 @@ pub fn get_personality_history(
     persona_id: String,
 ) -> AppResult<Vec<PersonalityEvent>> {
     state.ctx.db.personality_events_of(&persona_id)
+}
+
+#[tauri::command]
+pub fn get_mood(state: State<AppState>, persona_id: String) -> AppResult<MoodState> {
+    let settings = state.ctx.db.load_settings()?;
+    crate::personality::current_mood(&state.ctx.db, &persona_id, &settings, now_ms())
+}
+
+// ---------- 日記 (v0.2, FR-27) ----------
+
+#[tauri::command]
+pub fn list_diaries(state: State<AppState>, persona_id: String) -> AppResult<Vec<Diary>> {
+    state.ctx.db.list_diaries(&persona_id)
+}
+
+// ---------- 成長ダッシュボード・関係図 (v0.2, FR-29/30) ----------
+
+/// 性格軸ごとの時系列を変化履歴から導出する (FR-29)。値は FR-13 の履歴と一致する。
+pub fn compute_trait_series(events: &[PersonalityEvent], traits: &[TraitValue]) -> Vec<Series> {
+    let mut out = Vec::new();
+    for key in TRAIT_KEYS {
+        let item = format!("trait:{key}");
+        let mut points: Vec<SeriesPoint> = events
+            .iter()
+            .filter(|e| e.item == item)
+            .filter_map(|e| e.new_value.parse::<i64>().ok().map(|v| SeriesPoint { t: e.created_at, value: v }))
+            .collect();
+        points.sort_by_key(|p| p.t); // events は DESC のため昇順へ
+        if points.is_empty() {
+            if let Some(cur) = traits.iter().find(|t| t.key == key) {
+                points.push(SeriesPoint { t: now_ms(), value: cur.value });
+            }
+        }
+        out.push(Series { key: key.to_string(), points });
+    }
+    out
+}
+
+/// 相手ごとの親密度の時系列を変化履歴から導出する (FR-29)
+pub fn compute_intimacy_series(events: &[PersonalityEvent], target_name: &str) -> Series {
+    let item = format!("intimacy:{target_name}");
+    let mut points: Vec<SeriesPoint> = events
+        .iter()
+        .filter(|e| e.item == item)
+        .filter_map(|e| e.new_value.parse::<i64>().ok().map(|v| SeriesPoint { t: e.created_at, value: v }))
+        .collect();
+    points.sort_by_key(|p| p.t);
+    Series { key: target_name.to_string(), points }
+}
+
+/// 全ペルソナ+ユーザーの関係図を組み立てる (FR-30)
+pub fn build_relationship_graph(personas: &[Persona], relationships: &[Relationship]) -> RelationshipGraph {
+    let mut nodes = vec![GraphNode { id: "user".into(), name: "ユーザー".into(), kind: "user".into() }];
+    for p in personas {
+        nodes.push(GraphNode { id: p.id.clone(), name: p.name.clone(), kind: "persona".into() });
+    }
+    let known: std::collections::HashSet<&str> =
+        personas.iter().map(|p| p.id.as_str()).chain(std::iter::once("user")).collect();
+    let edges = relationships
+        .iter()
+        // 削除済み相手など、ノードに存在しない対象への辺は描かない
+        .filter(|r| known.contains(r.target_id.as_str()))
+        .map(|r| GraphEdge { from: r.persona_id.clone(), to: r.target_id.clone(), intimacy: r.intimacy })
+        .collect();
+    RelationshipGraph { nodes, edges }
+}
+
+#[tauri::command]
+pub fn get_trait_series(state: State<AppState>, persona_id: String) -> AppResult<Vec<Series>> {
+    let events = state.ctx.db.personality_events_of(&persona_id)?;
+    let traits = state.ctx.db.traits_of(&persona_id)?;
+    Ok(compute_trait_series(&events, &traits))
+}
+
+#[tauri::command]
+pub fn get_intimacy_series(
+    state: State<AppState>,
+    persona_id: String,
+    target_name: String,
+) -> AppResult<Series> {
+    let events = state.ctx.db.personality_events_of(&persona_id)?;
+    Ok(compute_intimacy_series(&events, &target_name))
+}
+
+#[tauri::command]
+pub fn get_relationship_graph(state: State<AppState>) -> AppResult<RelationshipGraph> {
+    let personas = state.ctx.db.list_personas()?;
+    let relationships = state.ctx.db.all_relationships()?;
+    Ok(build_relationship_graph(&personas, &relationships))
 }
 
 // ---------- エクスポート/インポート (FR-18) ----------
@@ -466,6 +602,52 @@ mod tests {
         // 範囲外は 0-100 にクランプ
         assert_eq!(traits.iter().find(|t| t.key == "sociability").unwrap().value, 100);
         assert_eq!(traits.iter().find(|t| t.key == "empathy").unwrap().value, DEFAULT_TRAIT_VALUE);
+    }
+
+    #[test]
+    fn trait_series_matches_events_fr29() {
+        // FR-29: 系列の値が変化履歴と一致する
+        let pid = "p1";
+        let ev = |item: &str, new: &str, t: i64| PersonalityEvent {
+            id: new_id(), persona_id: pid.into(), session_id: None,
+            item: item.into(), old_value: "50".into(), new_value: new.into(), created_at: t,
+        };
+        // events は DESC で来る想定 (新しい順)
+        let events = vec![
+            ev("trait:sociability", "54", 300),
+            ev("trait:sociability", "52", 200),
+            ev("intimacy:ユーザー", "25", 250),
+        ];
+        let traits = vec![TraitValue { key: "sociability".into(), value: 54 }];
+        let series = compute_trait_series(&events, &traits);
+        let soc = series.iter().find(|s| s.key == "sociability").unwrap();
+        // 昇順に並ぶ
+        assert_eq!(soc.points.iter().map(|p| p.value).collect::<Vec<_>>(), vec![52, 54]);
+        assert!(soc.points[0].t < soc.points[1].t);
+        // 履歴のない軸は現在値1点
+        let emp = series.iter().find(|s| s.key == "empathy").unwrap();
+        assert_eq!(emp.points.len(), 0); // traits に empathy がないので空
+        // 親密度系列
+        let intim = compute_intimacy_series(&events, "ユーザー");
+        assert_eq!(intim.points.len(), 1);
+        assert_eq!(intim.points[0].value, 25);
+    }
+
+    #[test]
+    fn relationship_graph_nodes_and_edges_fr30() {
+        let a = Persona { id: "a".into(), name: "アリス".into(), description: String::new(), speech_style: String::new(), values_text: String::new(), self_intro: String::new(), created_at: 0, last_talked_at: None };
+        let b = Persona { id: "b".into(), name: "ボブ".into(), ..a.clone() };
+        let rels = vec![
+            Relationship { persona_id: "a".into(), target_kind: "user".into(), target_id: "user".into(), target_name: "ユーザー".into(), intimacy: 40, impression_text: String::new(), updated_at: 0 },
+            Relationship { persona_id: "a".into(), target_kind: "persona".into(), target_id: "b".into(), target_name: "ボブ".into(), intimacy: 55, impression_text: String::new(), updated_at: 0 },
+            // 削除済み相手への関係は辺にしない
+            Relationship { persona_id: "a".into(), target_kind: "persona".into(), target_id: "gone".into(), target_name: "(削除済み)".into(), intimacy: 10, impression_text: String::new(), updated_at: 0 },
+        ];
+        let g = build_relationship_graph(&[a, b], &rels);
+        assert_eq!(g.nodes.len(), 3); // user + アリス + ボブ
+        assert!(g.nodes.iter().any(|n| n.id == "user"));
+        assert_eq!(g.edges.len(), 2); // 存在するノード宛の2辺のみ
+        assert!(g.edges.iter().any(|e| e.to == "b" && e.intimacy == 55));
     }
 
     #[test]

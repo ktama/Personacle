@@ -79,6 +79,21 @@ export function chatView(opts: ChatOptions): ChatController {
     return session;
   };
 
+  // 話しかけ (FR-21): 画面を開いたときにセッションを用意し、ペルソナから話しかけさせる。
+  // 生成可否・接続失敗はコア側で判定され、失敗時は無通知 (EC-13)。
+  const tryGreeting = async () => {
+    try {
+      const s = await ensureSession();
+      setGenerating(true);
+      const did = await api.requestGreeting(s.id);
+      // 話しかけが生成されない場合は入力ロックを解除 (生成された場合は utterance_completed が解除)
+      if (!did) setGenerating(false);
+    } catch {
+      // セッション作成に失敗しても通常の入力は可能なまま (EC-13)
+      setGenerating(false);
+    }
+  };
+
   const send = async () => {
     if (generating) return; // 生成中の二重送信を防ぐ
     const text = input.value;
@@ -133,6 +148,9 @@ export function chatView(opts: ChatOptions): ChatController {
     banner,
     el("div", { class: "chat-input-row" }, [input, el("div", { class: "chat-input-side" }, [counter, sendBtn, cancelBtn])]),
   ]);
+
+  // 画面を開いたら話しかけを試みる (FR-21)
+  void tryGreeting();
 
   return {
     root,

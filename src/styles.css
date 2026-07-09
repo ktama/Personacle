@@ -706,3 +706,56 @@ body {
   color: var(--danger);
   margin: 3px 0;
 }
+
+/* ---------- v0.2 ---------- */
+
+/* ムード (FR-25) */
+.mood-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.mood-badge {
+  display: inline-block; padding: 2px 12px; border-radius: 12px;
+  font-size: 0.9em; border: 1px solid var(--border);
+}
+.mood-pos { background: rgba(126, 200, 126, 0.18); color: var(--ok); }
+.mood-neg { background: rgba(224, 108, 117, 0.18); color: var(--danger); }
+.mood-neutral { background: var(--bg-hover); color: var(--text-muted); }
+
+/* 司会システム発話 (FR-35) */
+.bubble-system {
+  align-self: center; max-width: 90%; text-align: center;
+  background: transparent; color: var(--text-muted);
+  border: 1px dashed var(--border); font-size: 0.9em; font-style: italic;
+}
+.bubble-system .bubble-name { color: var(--accent); }
+
+/* グループチャット */
+.group-target { max-width: 160px; margin-bottom: 6px; }
+.speaker-selecting {
+  align-self: center; color: var(--text-muted); font-size: 0.85em;
+  padding: 4px 12px; font-style: italic;
+}
+
+/* 記憶検索 (FR-28) */
+.memory-search { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.kind-filters { display: flex; flex-wrap: wrap; gap: 12px; }
+.memory-sources { margin-top: 6px; padding-left: 8px; border-left: 2px solid var(--border); font-size: 0.9em; }
+.source-item { color: var(--text-muted); padding: 2px 0; }
+
+/* 日記 (FR-27) */
+.diary-list { display: flex; flex-direction: column; gap: 14px; }
+.diary-entry { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; }
+.diary-date { color: var(--accent); font-weight: 600; margin-bottom: 6px; }
+.diary-body { white-space: pre-wrap; line-height: 1.6; }
+
+/* ダッシュボード・グラフ (FR-29/30, ADR-17) */
+.dashboard-section { margin-bottom: 24px; }
+.dashboard-section h3 { margin-bottom: 8px; }
+.line-chart { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; }
+.chart-grid { stroke: var(--border); stroke-width: 1; }
+.chart-axis { fill: var(--text-muted); font-size: 10px; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; font-size: 0.85em; }
+.legend-item { display: flex; align-items: center; gap: 5px; }
+.legend-swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.relationship-graph { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px; max-width: 480px; }
+.graph-node text.graph-label { fill: var(--text); font-size: 13px; }
+.graph-node:focus { outline: none; }
+.graph-node:focus circle { stroke: var(--ok); }

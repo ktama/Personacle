@@ -19,6 +19,7 @@ export function settingsView(onSaved: () => void): HTMLElement {
   const embedModelInput = el("input", { class: "input", type: "text", list: "model-list" });
   const modelList = el("datalist", { id: "model-list" });
   const turnLimitInput = el("input", { class: "input input-narrow", type: "number", min: "2", max: "50" });
+  const greetingToggle = el("input", { type: "checkbox" }); // FR-21
   const resultBox = el("div", { class: "test-result" });
 
   let current: Settings | null = null;
@@ -28,6 +29,7 @@ export function settingsView(onSaved: () => void): HTMLElement {
     chatModelInput.value = s.chatModel;
     embedModelInput.value = s.embedModel;
     turnLimitInput.value = String(s.autoTurnLimit);
+    greetingToggle.checked = s.greetingEnabled;
   });
 
   const testBtn = el("button", {
@@ -88,6 +90,7 @@ export function settingsView(onSaved: () => void): HTMLElement {
       chatModel: chatModelInput.value.trim(),
       embedModel: embedModelInput.value.trim(),
       autoTurnLimit: Math.max(2, Math.min(50, Number(turnLimitInput.value) || 12)),
+      greetingEnabled: greetingToggle.checked,
     };
     await api.updateSettings(next);
     current = next;
@@ -108,6 +111,7 @@ export function settingsView(onSaved: () => void): HTMLElement {
     modelList,
     el("label", { class: "field-label", text: "自律会話のターン数上限 (2〜50)" }),
     turnLimitInput,
+    el("label", { class: "toggle-label" }, [greetingToggle, "チャットを開いたときにペルソナから話しかける"]),
     el("div", { class: "form-buttons" }, [
       el("button", { class: "btn btn-primary", text: "保存", onClick: () => void save(true) }),
       testBtn,

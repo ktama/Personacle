@@ -127,6 +127,15 @@ pub fn run() {
             commands::get_settings,
             commands::update_settings,
             commands::test_connection,
+            // v0.2
+            commands::request_greeting,
+            commands::search_memories,
+            commands::get_memory_sources,
+            commands::get_mood,
+            commands::list_diaries,
+            commands::get_trait_series,
+            commands::get_intimacy_series,
+            commands::get_relationship_graph,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

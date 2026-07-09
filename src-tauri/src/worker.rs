@@ -110,8 +110,15 @@ fn extraction_prompt(persona_name: &str, transcript: &str) -> Vec<ChatMessage> {
 
 // ---------- 人格評定 (FR-12) ----------
 
-/// 評定JSONを PartnerAssessment + 性格デルタに変換する
-pub fn parse_assessment(v: &Value) -> (Vec<(String, i64)>, PartnerAssessment) {
+/// ムード評定の結果 (v0.2, ADR-13)
+#[derive(Debug, Clone, Default)]
+pub struct MoodRating {
+    pub delta: i64,
+    pub label: String,
+}
+
+/// 評定JSONを 性格デルタ + PartnerAssessment + ムード評定 に変換する
+pub fn parse_assessment(v: &Value) -> (Vec<(String, i64)>, PartnerAssessment, MoodRating) {
     let mut trait_deltas = Vec::new();
     if let Some(traits) = v["traits"].as_object() {
         for key in TRAIT_KEYS {
@@ -124,7 +131,16 @@ pub fn parse_assessment(v: &Value) -> (Vec<(String, i64)>, PartnerAssessment) {
         intimacy_delta: v["intimacyDelta"].as_i64().or(v["intimacy_delta"].as_i64()).unwrap_or(0),
         impression: v["impression"].as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
     };
-    (trait_deltas, pa)
+    // ムード (v0.2): mood.delta / mood.label。旧形式(moodDelta)も許容
+    let mood = MoodRating {
+        delta: v["mood"]["delta"].as_i64().or(v["moodDelta"].as_i64()).unwrap_or(0),
+        label: v["mood"]["label"]
+            .as_str()
+            .or(v["moodLabel"].as_str())
+            .map(|s| s.trim().chars().take(20).collect())
+            .unwrap_or_default(),
+    };
+    (trait_deltas, pa, mood)
 }
 
 fn assessment_prompt(
@@ -141,9 +157,10 @@ fn assessment_prompt(
         .join(", ");
     let system = format!(
         "あなたは会話ログを分析し、「{}」の心境の変化を評定する係である。JSONのみを出力する。\n\
-         形式: {{\"traits\": {{\"sociability\": 整数, \"empathy\": 整数, \"caution\": 整数, \"assertiveness\": 整数, \"cheerfulness\": 整数}}, \"intimacy_delta\": 整数, \"impression\": \"相手({})への現在の印象を50字以内\"}}\n\
+         形式: {{\"traits\": {{\"sociability\": 整数, \"empathy\": 整数, \"caution\": 整数, \"assertiveness\": 整数, \"cheerfulness\": 整数}}, \"intimacy_delta\": 整数, \"impression\": \"相手({})への現在の印象を50字以内\", \"mood\": {{\"delta\": 整数, \"label\": \"今の気分を表す短い語(10字以内)\"}}}}\n\
          - traits は各性格軸の変化量。-2〜2 の範囲。変化なしは 0\n\
          - intimacy_delta は相手への親密度の変化量。-5〜5 の範囲\n\
+         - mood.delta はこの会話で受けた気分の変化。-50〜50 の範囲(平常への戻りは考慮しなくてよい)。label は「上機嫌」「落ち込み」等\n\
          - 現在の性格 (0-100): {}\n\
          - 相手への現在の親密度 (0-100): {}",
         persona.name, partner_name, trait_lines, current_intimacy
@@ -151,6 +168,49 @@ fn assessment_prompt(
     vec![
         ChatMessage::new("system", system),
         ChatMessage::new("user", format!("会話ログ:\n{transcript}")),
+    ]
+}
+
+// ---------- 記憶統合 (v0.2, FR-22, ADR-12) ----------
+
+/// 統合文JSONを (content, kind, importance) に変換する
+pub fn parse_consolidation(v: &Value) -> Option<(String, String, i64)> {
+    let content: String = v["content"].as_str()?.trim().chars().take(MAX_MEMORY_CONTENT_CHARS).collect();
+    if content.is_empty() {
+        return None;
+    }
+    let kind = match v["kind"].as_str() {
+        Some(k @ ("fact" | "event" | "promise" | "impression")) => k.to_string(),
+        _ => "fact".to_string(),
+    };
+    let importance = v["importance"].as_i64().unwrap_or(5).clamp(1, 10);
+    Some((content, kind, importance))
+}
+
+fn consolidation_prompt(persona_name: &str, contents: &[String]) -> Vec<ChatMessage> {
+    let list = contents.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n");
+    let system = format!(
+        "あなたは「{persona_name}」の記憶を整理する係である。次の複数の関連する記憶を、要点を保ったまま1つに要約・一般化する。JSONのみを出力する。\n\
+         形式: {{\"content\": \"統合した記憶(1〜2文)\", \"kind\": \"fact|event|promise|impression\", \"importance\": 1から10の整数}}\n\
+         - 元の記憶の重要な情報を落とさない\n- JSON以外の文章を書かない"
+    );
+    vec![
+        ChatMessage::new("system", system),
+        ChatMessage::new("user", format!("統合する記憶:\n{list}")),
+    ]
+}
+
+// ---------- 日記 (v0.2, FR-26, ADR-14) ----------
+
+fn diary_prompt(persona_name: &str, date: &str, transcript: &str) -> Vec<ChatMessage> {
+    let system = format!(
+        "あなたは「{persona_name}」本人である。今日({date})の会話を振り返り、日記を書く。\n\
+         - {persona_name}自身の一人称視点で、その日感じたことや印象に残った出来事を2〜4文で書く\n\
+         - 日記の本文のみを出力し、日付や見出しは付けない"
+    );
+    vec![
+        ChatMessage::new("system", system),
+        ChatMessage::new("user", format!("今日の会話:\n{transcript}")),
     ]
 }
 
@@ -216,8 +276,24 @@ pub async fn postprocess_session(ctx: &AppCtx, session_id: &str) -> AppResult<()
     let transcript = build_transcript(&utterances);
     let participants = ctx.db.participants_of(session_id)?;
 
+    // ADR-10: ユーザー発話が0件の1対1セッション(話しかけのみで終了)は後処理をスキップして確定する
+    if session.kind == "user_dialogue" && !utterances.iter().any(|u| u.speaker_kind == "user") {
+        for (pid, _, _) in &participants {
+            ctx.db.mark_participant_processed(session_id, pid)?;
+        }
+        ctx.db.set_session_status(session_id, "processed", None)?;
+        ctx.sink.emit(
+            "session_status_changed",
+            json!({ "sessionId": session_id, "status": "processed" }),
+        );
+        return Ok(());
+    }
+
+    let session_date = local_date_of(session.started_at); // 日記の帰属日 (EC-17)
     let mut total_memories = 0usize;
     let mut total_events = 0usize;
+    let mut total_consolidated = 0usize;
+    let mut any_diary = false;
     let mut all_done = true;
 
     for (pid, pname, processed) in &participants {
@@ -259,10 +335,12 @@ pub async fn postprocess_session(ctx: &AppCtx, session_id: &str) -> AppResult<()
             extracted.iter().map(|_| None).collect()
         };
 
+        let mut new_memory_ids: Vec<String> = Vec::new();
         for (m, emb) in extracted.iter().zip(embeddings.iter()) {
+            let mem_id = new_id();
             ctx.db.insert_memory(
                 &Memory {
-                    id: new_id(),
+                    id: mem_id.clone(),
                     persona_id: pid.clone(),
                     content: m.content.clone(),
                     kind: m.kind.clone(),
@@ -275,6 +353,9 @@ pub async fn postprocess_session(ctx: &AppCtx, session_id: &str) -> AppResult<()
                 },
                 emb.as_deref(),
             )?;
+            if emb.is_some() {
+                new_memory_ids.push(mem_id);
+            }
             total_memories += 1;
         }
 
@@ -307,12 +388,19 @@ pub async fn postprocess_session(ctx: &AppCtx, session_id: &str) -> AppResult<()
             )
             .await
             {
-                let (trait_deltas, pa) = parse_assessment(&assess_v);
+                let (trait_deltas, pa, mood) = parse_assessment(&assess_v);
                 if !traits_applied {
                     let ev1 = personality::apply_trait_deltas(
                         &ctx.db, pid, session_id, &trait_deltas, &settings, now_ms(),
                     )?;
                     total_events += ev1.len();
+                    // ムード適用 (v0.2, ADR-13)。性格軸と同じくセッションあたり1回のみ。
+                    if let Some(me) = personality::apply_mood(
+                        &ctx.db, pid, session_id, mood.delta, &mood.label, &settings, now_ms(),
+                    )? {
+                        total_events += 1;
+                        let _ = me;
+                    }
                     traits_applied = true;
                 }
                 let ev2 = personality::apply_relationship(
@@ -322,6 +410,18 @@ pub async fn postprocess_session(ctx: &AppCtx, session_id: &str) -> AppResult<()
             } else {
                 tracing::warn!("人格評定に失敗 (この相手の評定をスキップ): persona={pname} partner={partner_name}");
             }
+        }
+
+        // 5. 記憶統合 (v0.2, FR-22, ADR-12)
+        match consolidate_new_memories(ctx, pid, &persona.name, &new_memory_ids, &settings).await {
+            Ok(n) => total_consolidated += n,
+            Err(e) => tracing::warn!("記憶統合に失敗 (スキップ): persona={pname}: {e}"),
+        }
+
+        // 6. 日記 (v0.2, FR-26, ADR-14): その日の全セッションから当日分を生成・上書き
+        match generate_diary(ctx, pid, &persona.name, &session_date, &settings).await {
+            Ok(made) => any_diary |= made,
+            Err(e) => tracing::warn!("日記生成に失敗 (スキップ): persona={pname}: {e}"),
         }
 
         ctx.db.mark_participant_processed(session_id, pid)?;
@@ -343,6 +443,8 @@ pub async fn postprocess_session(ctx: &AppCtx, session_id: &str) -> AppResult<()
                 "sessionId": session_id,
                 "memoryCount": total_memories,
                 "eventCount": total_events,
+                "consolidatedCount": total_consolidated,
+                "diaryUpdated": any_diary,
             }),
         );
         ctx.sink.emit(
@@ -351,6 +453,120 @@ pub async fn postprocess_session(ctx: &AppCtx, session_id: &str) -> AppResult<()
         );
     }
     Ok(())
+}
+
+/// 新規記憶を核に類似クラスタを検出し、統合記憶を生成する (FR-22, ADR-12)。
+/// 統合記憶の挿入・元記憶のアーカイブ+由来リンクを1トランザクションで行う (EC-15)。
+async fn consolidate_new_memories(
+    ctx: &AppCtx,
+    persona_id: &str,
+    persona_name: &str,
+    new_memory_ids: &[String],
+    settings: &Settings,
+) -> AppResult<usize> {
+    if settings.embed_model.is_empty() || new_memory_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for new_id_s in new_memory_ids {
+        // 都度、最新の非アーカイブ記憶(+埋め込み)を候補に取り直す(前の統合結果を反映)
+        let candidates = ctx.db.memories_for_recall(persona_id)?;
+        // 新規記憶がまだ非アーカイブで、埋め込みを持つ場合のみ対象
+        let Some((_, Some(blob))) = candidates.iter().find(|(m, _)| &m.id == new_id_s) else {
+            continue;
+        };
+        let new_emb = memory::blob_to_embedding(blob);
+        let Some(members) =
+            memory::find_consolidation_cluster(new_id_s, &new_emb, &candidates, settings)
+        else {
+            continue; // EC-20: クラスタ不成立なら何もしない
+        };
+        let contents: Vec<String> = candidates
+            .iter()
+            .filter(|(m, _)| members.contains(&m.id))
+            .map(|(m, _)| m.content.clone())
+            .collect();
+        let Some(v) = chat_json_with_retry(
+            ctx,
+            &settings.chat_model,
+            consolidation_prompt(persona_name, &contents),
+        )
+        .await
+        else {
+            continue;
+        };
+        let Some((content, kind, importance)) = parse_consolidation(&v) else {
+            continue;
+        };
+        // 統合記憶の埋め込みを計算(失敗時は NULL のまま=後で再計算)
+        let emb_blob = match ctx.inference.embed(&settings.embed_model, &[content.clone()]).await {
+            Ok(mut vs) if !vs.is_empty() => Some(embedding_to_blob(&vs.remove(0))),
+            _ => None,
+        };
+        let cons_id = new_id();
+        ctx.db.insert_memory(
+            &Memory {
+                id: cons_id.clone(),
+                persona_id: persona_id.to_string(),
+                content,
+                kind,
+                importance,
+                has_embedding: emb_blob.is_some(),
+                source_session_id: None, // 統合記憶は単一セッション出所を持たない(由来は consolidated_into 逆引き)
+                created_at: now_ms(),
+                archived: false,
+                user_edited: false,
+            },
+            emb_blob.as_deref(),
+        )?;
+        ctx.db.consolidate_memories(&members, &cons_id)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// その日の全セッションからペルソナの日記を生成・上書きする (FR-26, ADR-14)。生成したら true。
+async fn generate_diary(
+    ctx: &AppCtx,
+    persona_id: &str,
+    persona_name: &str,
+    date: &str,
+    settings: &Settings,
+) -> AppResult<bool> {
+    if settings.chat_model.is_empty() {
+        return Ok(false);
+    }
+    // その日にこのペルソナが参加した全セッションの発話を集める(都度更新)
+    let sessions = ctx.db.list_sessions_for_persona(persona_id)?;
+    let mut lines: Vec<Utterance> = Vec::new();
+    for s in &sessions {
+        if local_date_of(s.started_at) == date {
+            lines.extend(ctx.db.utterances_of(&s.id)?);
+        }
+    }
+    lines.sort_by_key(|u| u.created_at);
+    let transcript = build_transcript(&lines);
+    if transcript.is_empty() {
+        return Ok(false); // EC-20: 対話がなければ生成しない
+    }
+    let req = ChatRequest {
+        model: settings.chat_model.clone(),
+        messages: diary_prompt(persona_name, date, &transcript),
+        temperature: 0.7,
+        max_tokens: Some(512),
+    };
+    let text = match ctx.inference.chat_once(req).await {
+        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => return Ok(false),
+    };
+    ctx.db.upsert_diary(&Diary {
+        id: new_id(),
+        persona_id: persona_id.to_string(),
+        date: date.to_string(),
+        content: text,
+        updated_at: now_ms(),
+    })?;
+    Ok(true)
 }
 
 /// 埋め込み未計算の記憶を再計算する (起動時リカバリ・FR-11 の編集後再計算)
@@ -444,13 +660,29 @@ mod tests {
     #[test]
     fn parse_assessment_reads_traits_and_partner() {
         let v: Value = serde_json::from_str(
-            r#"{"traits":{"sociability":2,"empathy":-1,"unknown":5},"intimacy_delta":3,"impression":"楽しい人"}"#,
+            r#"{"traits":{"sociability":2,"empathy":-1,"unknown":5},"intimacy_delta":3,"impression":"楽しい人","mood":{"delta":30,"label":"上機嫌"}}"#,
         )
         .unwrap();
-        let (deltas, pa) = parse_assessment(&v);
+        let (deltas, pa, mood) = parse_assessment(&v);
         assert_eq!(deltas.len(), 2); // 未知の軸は無視
         assert_eq!(pa.intimacy_delta, 3);
         assert_eq!(pa.impression.as_deref(), Some("楽しい人"));
+        assert_eq!(mood.delta, 30);
+        assert_eq!(mood.label, "上機嫌");
+    }
+
+    #[test]
+    fn parse_consolidation_validates() {
+        let v: Value = serde_json::from_str(
+            r#"{"content":"ユーザーは辛い食べ物を好む","kind":"fact","importance":8}"#,
+        ).unwrap();
+        let (content, kind, imp) = parse_consolidation(&v).unwrap();
+        assert!(content.contains("辛い"));
+        assert_eq!(kind, "fact");
+        assert_eq!(imp, 8);
+        // content 空は None
+        let bad: Value = serde_json::from_str(r#"{"content":"","kind":"fact"}"#).unwrap();
+        assert!(parse_consolidation(&bad).is_none());
     }
 
     /// FR-08/12/15: 対話→終了→後処理で記憶・関係性・イベントが生まれる
@@ -501,12 +733,14 @@ mod tests {
         let env = test_ctx(MockInference::with_replies(&[
             "アリスの発話",
             "ボブの発話",
-            // アリスの後処理
+            // アリスの後処理: 抽出→評定→日記
             r#"[{"content":"ボブは釣りが趣味だ","kind":"fact","importance":6}]"#,
             r#"{"traits":{},"intimacy_delta":2,"impression":"穏やかな人"}"#,
-            // ボブの後処理
+            "アリスの日記",
+            // ボブの後処理: 抽出→評定→日記
             r#"[{"content":"アリスと趣味の話をした","kind":"event","importance":4}]"#,
             r#"{"traits":{},"intimacy_delta":3,"impression":"明るい人"}"#,
+            "ボブの日記",
         ]));
         let mut settings = env.ctx.db.load_settings().unwrap();
         settings.chat_model = "mock".into();
@@ -540,6 +774,7 @@ mod tests {
             // 両方の評定が sociability +2 を返す → 2回適用なら +4 になってしまうケース
             replies.push(r#"{"traits":{"sociability":2},"intimacy_delta":3,"impression":"良い人"}"#.into());
             replies.push(r#"{"traits":{"sociability":2},"intimacy_delta":4,"impression":"面白い人"}"#.into());
+            replies.push("その日の日記".into()); // v0.2: 日記生成の分
         }
         let reply_refs: Vec<&str> = replies.iter().map(|s| s.as_str()).collect();
         let env = test_ctx(MockInference::with_replies(&reply_refs));
@@ -605,6 +840,140 @@ mod tests {
         let mems = env.ctx.db.memories_of(&a.id, false).unwrap();
         assert_eq!(mems.len(), 1);
         assert_eq!(mems[0].content, "再試行で取れた記憶");
+    }
+
+    fn insert_user_utt(ctx: &AppCtx, sid: &str, content: &str) {
+        ctx.db.insert_utterance(&Utterance {
+            id: new_id(), session_id: sid.into(), speaker_kind: "user".into(),
+            speaker_id: "user".into(), speaker_name: "ユーザー".into(),
+            content: content.into(), state: "complete".into(), created_at: now_ms(),
+        }).unwrap();
+    }
+
+    /// FR-22/ADR-12: 類似記憶が閾値に達すると統合され、元記憶はアーカイブされる
+    #[tokio::test]
+    async fn consolidation_clusters_and_archives_fr22() {
+        let env = test_ctx(MockInference::with_replies(&[
+            // 抽出: 新規記憶1件
+            r#"[{"content":"ユーザーはカレーが好き","kind":"fact","importance":6}]"#,
+            // 評定
+            r#"{"traits":{},"intimacy_delta":1,"impression":"","mood":{"delta":0,"label":""}}"#,
+            // 統合文
+            r#"{"content":"ユーザーは辛いカレーを好む","kind":"fact","importance":8}"#,
+            // 日記
+            "今日はカレーの話で盛り上がった。",
+        ]));
+        let mut settings = env.ctx.db.load_settings().unwrap();
+        settings.chat_model = "mock".into();
+        settings.embed_model = "mock-embed".into(); // 全記憶に同一埋め込み → 相互に高類似
+        settings.consolidate_min_cluster = 5;
+        env.ctx.db.save_settings(&settings).unwrap();
+
+        let a = add_persona(&env.ctx, "アリス");
+        // 既存の類似記憶を4件(埋め込み付き)用意 → 抽出1件と合わせて5件でクラスタ成立
+        for i in 0..4 {
+            env.ctx.db.insert_memory(&Memory {
+                id: new_id(), persona_id: a.id.clone(), content: format!("カレーの記憶{i}"),
+                kind: "fact".into(), importance: 5, has_embedding: true, source_session_id: None,
+                created_at: now_ms(), archived: false, user_edited: false,
+            }, Some(&crate::memory::embedding_to_blob(&[1.0, 0.0]))).unwrap();
+        }
+
+        let s = start_session(&env.ctx, "user_dialogue", &[a.id.clone()], "").unwrap();
+        insert_user_utt(&env.ctx, &s.id, "カレーが好きなんだ");
+        end_session(&env.ctx, &s.id).unwrap();
+        postprocess_session(&env.ctx, &s.id).await.unwrap();
+
+        // 統合記憶1件のみが非アーカイブ(元4件+新規1件はアーカイブ)
+        let active = env.ctx.db.memories_of(&a.id, false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].content.contains("辛いカレー"));
+        // 由来は5件
+        assert_eq!(env.ctx.db.memory_sources(&active[0].id).unwrap().len(), 5);
+        // 全体では6件(5アーカイブ + 1統合)
+        assert_eq!(env.ctx.db.memories_of(&a.id, true).unwrap().len(), 6);
+    }
+
+    /// EC-15: 後処理を再実行しても統合が二重に起きない(処理済みで早期リターン)
+    #[tokio::test]
+    async fn consolidation_idempotent_ec15() {
+        let env = test_ctx(MockInference::with_replies(&[
+            r#"[{"content":"新しい記憶","kind":"fact","importance":6}]"#,
+            r#"{"traits":{},"intimacy_delta":0,"mood":{"delta":0,"label":""}}"#,
+            r#"{"content":"統合記憶","kind":"fact","importance":7}"#,
+            "日記本文",
+        ]));
+        let mut settings = env.ctx.db.load_settings().unwrap();
+        settings.chat_model = "mock".into();
+        settings.embed_model = "mock-embed".into();
+        settings.consolidate_min_cluster = 3;
+        env.ctx.db.save_settings(&settings).unwrap();
+
+        let a = add_persona(&env.ctx, "アリス");
+        for i in 0..2 {
+            env.ctx.db.insert_memory(&Memory {
+                id: new_id(), persona_id: a.id.clone(), content: format!("既存{i}"),
+                kind: "fact".into(), importance: 5, has_embedding: true, source_session_id: None,
+                created_at: now_ms(), archived: false, user_edited: false,
+            }, Some(&crate::memory::embedding_to_blob(&[1.0, 0.0]))).unwrap();
+        }
+        let s = start_session(&env.ctx, "user_dialogue", &[a.id.clone()], "").unwrap();
+        insert_user_utt(&env.ctx, &s.id, "やあ");
+        end_session(&env.ctx, &s.id).unwrap();
+        postprocess_session(&env.ctx, &s.id).await.unwrap();
+        let after_first = env.ctx.db.memories_of(&a.id, true).unwrap().len();
+
+        // 再実行 → processed で早期リターン、記憶は増えない
+        postprocess_session(&env.ctx, &s.id).await.unwrap();
+        assert_eq!(env.ctx.db.memories_of(&a.id, true).unwrap().len(), after_first);
+    }
+
+    /// FR-24/26: 後処理でムードが評定され、日記が当日分として生成される
+    #[tokio::test]
+    async fn mood_and_diary_generated_fr24_fr26() {
+        let env = test_ctx(MockInference::with_replies(&[
+            r#"[{"content":"褒められた","kind":"event","importance":5}]"#,
+            r#"{"traits":{},"intimacy_delta":2,"impression":"優しい","mood":{"delta":40,"label":"上機嫌"}}"#,
+            "今日はたくさん褒めてもらえて嬉しかった。",
+        ]));
+        let mut settings = env.ctx.db.load_settings().unwrap();
+        settings.chat_model = "mock".into();
+        env.ctx.db.save_settings(&settings).unwrap();
+
+        let a = add_persona(&env.ctx, "アリス");
+        let s = start_session(&env.ctx, "user_dialogue", &[a.id.clone()], "").unwrap();
+        insert_user_utt(&env.ctx, &s.id, "すごいね!");
+        end_session(&env.ctx, &s.id).unwrap();
+        postprocess_session(&env.ctx, &s.id).await.unwrap();
+
+        // ムード (FR-24): +40 が適用され mood_event に記録
+        let mood = env.ctx.db.get_mood_raw(&a.id).unwrap();
+        assert_eq!(mood.0, 40);
+        assert_eq!(env.ctx.db.mood_events_of(&a.id).unwrap().len(), 1);
+        // 日記 (FR-26): 当日分が生成される
+        let diaries = env.ctx.db.list_diaries(&a.id).unwrap();
+        assert_eq!(diaries.len(), 1);
+        assert!(diaries[0].content.contains("褒め"));
+    }
+
+    /// ADR-10: 話しかけのみ(ユーザー発話0件)のセッションは後処理をスキップし記憶を作らない
+    #[tokio::test]
+    async fn greeting_only_session_skips_postprocess_adr10() {
+        let env = test_ctx(MockInference::with_replies(&["やあ、久しぶり!"]));
+        let mut settings = env.ctx.db.load_settings().unwrap();
+        settings.chat_model = "mock".into();
+        env.ctx.db.save_settings(&settings).unwrap();
+
+        let a = add_persona(&env.ctx, "アリス");
+        let s = start_session(&env.ctx, "user_dialogue", &[a.id.clone()], "").unwrap();
+        crate::conversation::request_greeting(&env.ctx, &s.id).await.unwrap(); // ペルソナ発話のみ
+        end_session(&env.ctx, &s.id).unwrap();
+        postprocess_session(&env.ctx, &s.id).await.unwrap();
+
+        // 記憶・日記は作られず、セッションは processed になる
+        assert!(env.ctx.db.memories_of(&a.id, true).unwrap().is_empty());
+        assert!(env.ctx.db.list_diaries(&a.id).unwrap().is_empty());
+        assert_eq!(env.ctx.db.get_session(&s.id).unwrap().unwrap().status, "processed");
     }
 
     /// EC-03: active のまま残ったセッションが起動時に回収される

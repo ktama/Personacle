@@ -96,6 +96,35 @@ pub fn archive_overflow(db: &Db, persona_id: &str, settings: &Settings, now_ms: 
     Ok(n)
 }
 
+/// 記憶統合のクラスタ検出 (ADR-12, FR-22)。
+/// 新規記憶 new_emb に対しコサイン類似度が閾値以上の非アーカイブ既存記憶を集め、
+/// 新規記憶を含めた件数が最小クラスタ件数以上ならメンバーID群(新規を先頭に含む)を返す。
+/// candidates は memories_for_recall の戻り(非アーカイブ+埋め込み)。EC-20: 満たなければ None。
+pub fn find_consolidation_cluster(
+    new_id: &str,
+    new_emb: &[f32],
+    candidates: &[(Memory, Option<Vec<u8>>)],
+    settings: &Settings,
+) -> Option<Vec<String>> {
+    let sim_th = settings.consolidate_sim as f32;
+    let mut ids: Vec<String> = vec![new_id.to_string()];
+    for (m, blob) in candidates {
+        if m.id == new_id || m.archived {
+            continue;
+        }
+        if let Some(b) = blob {
+            if cosine(new_emb, &blob_to_embedding(b)) >= sim_th {
+                ids.push(m.id.clone());
+            }
+        }
+    }
+    if (ids.len() as i64) >= settings.consolidate_min_cluster.max(2) {
+        Some(ids)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +219,64 @@ mod tests {
         db.insert_memory(&mk_memory(&p.id, "新しい", 5, now), None).unwrap();
         let got = retrieve(&db, &p.id, None, &s, now).unwrap();
         assert_eq!(got[0].content, "新しい");
+    }
+
+    fn mk_scored(pid: &str, content: &str, emb: &[f32]) -> (Memory, Option<Vec<u8>>) {
+        (mk_memory(pid, content, 5, now_ms()), Some(embedding_to_blob(emb)))
+    }
+
+    #[test]
+    fn consolidation_cluster_forms_at_threshold() {
+        // FR-22/ADR-12: 類似 (>=0.80) が新規含め5件以上でクラスタ成立
+        let s = Settings { consolidate_sim: 0.80, consolidate_min_cluster: 5, ..Settings::default() };
+        let pid = "p1";
+        let new_id_s = new_id();
+        let new_emb = [1.0f32, 0.0];
+        // 類似4件 (ほぼ同方向) + 直交1件
+        let cands = vec![
+            (Memory { id: new_id_s.clone(), ..mk_memory(pid, "新規", 5, now_ms()) }, Some(embedding_to_blob(&new_emb))),
+            mk_scored(pid, "類似1", &[0.99, 0.14]),
+            mk_scored(pid, "類似2", &[0.98, 0.20]),
+            mk_scored(pid, "類似3", &[1.0, 0.05]),
+            mk_scored(pid, "類似4", &[0.97, 0.24]),
+            mk_scored(pid, "無関係", &[0.0, 1.0]),
+        ];
+        let cluster = find_consolidation_cluster(&new_id_s, &new_emb, &cands, &s).unwrap();
+        // 新規 + 類似4 = 5件。無関係は入らない
+        assert_eq!(cluster.len(), 5);
+        assert!(cluster.contains(&new_id_s));
+    }
+
+    #[test]
+    fn consolidation_skips_small_cluster() {
+        // EC-20: 類似が足りなければ統合しない
+        let s = Settings { consolidate_sim: 0.80, consolidate_min_cluster: 5, ..Settings::default() };
+        let pid = "p1";
+        let new_id_s = new_id();
+        let new_emb = [1.0f32, 0.0];
+        let cands = vec![
+            mk_scored(pid, "類似1", &[0.99, 0.14]),
+            mk_scored(pid, "類似2", &[0.98, 0.20]),
+        ];
+        assert!(find_consolidation_cluster(&new_id_s, &new_emb, &cands, &s).is_none());
+    }
+
+    #[test]
+    fn consolidation_excludes_archived_and_unembedded() {
+        let s = Settings { consolidate_sim: 0.80, consolidate_min_cluster: 3, ..Settings::default() };
+        let pid = "p1";
+        let new_id_s = new_id();
+        let new_emb = [1.0f32, 0.0];
+        let mut archived = mk_scored(pid, "アーカイブ済み", &[1.0, 0.0]);
+        archived.0.archived = true;
+        let no_emb = (mk_memory(pid, "埋め込みなし", 5, now_ms()), None);
+        let cands = vec![
+            mk_scored(pid, "類似1", &[0.99, 0.10]),
+            archived,
+            no_emb,
+        ];
+        // 新規 + 類似1 = 2件 < 3 → None (アーカイブ済み・埋め込みなしは数えない)
+        assert!(find_consolidation_cluster(&new_id_s, &new_emb, &cands, &s).is_none());
     }
 
     #[test]

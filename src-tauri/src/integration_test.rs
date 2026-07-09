@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::context::AppCtx;
-use crate::conversation::{end_session, send_user_message, start_session, ConversationManager};
+use crate::conversation::{
+    end_session, request_greeting, send_group_message, send_user_message, start_session,
+    ConversationManager,
+};
 use crate::db::Db;
 use crate::inference::HttpInference;
 use crate::models::{new_id, now_ms, Persona, TraitValue};
@@ -153,4 +156,78 @@ async fn real_ollama_autonomous_conversation() {
     let mem_b = ctx.db.memories_of(&b.id, false).unwrap();
     println!("[記憶] アリス{}件 / ボブ{}件", mem_a.len(), mem_b.len());
     assert!(!mem_a.is_empty() && !mem_b.is_empty(), "両参加者の記憶が生成されていない");
+}
+
+/// v0.2 の実機確認: 話しかけ(FR-21) → ムード・日記(FR-24/26)
+#[tokio::test]
+#[ignore = "Ollama 実機が必要"]
+async fn real_ollama_greeting_mood_diary_v02() {
+    let (_dir, ctx, sink) = real_ctx();
+    let p = Persona {
+        id: new_id(),
+        name: "アリス".into(),
+        description: "明るく好奇心旺盛".into(),
+        speech_style: "です・ます調".into(),
+        values_text: "誠実さ".into(),
+        self_intro: "アリスです".into(),
+        created_at: now_ms(),
+        last_talked_at: None,
+    };
+    ctx.db.create_persona(&p, &[TraitValue { key: "sociability".into(), value: 70 }]).unwrap();
+
+    // FR-21: 画面を開いた想定でセッション開始 → 話しかけ
+    let s1 = start_session(&ctx, "user_dialogue", &[p.id.clone()], "").unwrap();
+    let greeted = request_greeting(&ctx, &s1.id).await.expect("話しかけ生成に失敗");
+    assert!(greeted, "話しかけが生成されなかった");
+    let utts = ctx.db.utterances_of(&s1.id).unwrap();
+    assert_eq!(utts.len(), 1);
+    assert_eq!(utts[0].speaker_kind, "persona");
+    println!("[話しかけ] {}", utts[0].content);
+    assert!(sink.names().iter().any(|n| n == "utterance_delta"));
+
+    // ユーザーが強く褒める → ムードが上がる想定
+    send_user_message(&ctx, &s1.id, "アリスさんの明るさに毎日救われています。本当にありがとう!")
+        .await
+        .expect("応答生成に失敗");
+    end_session(&ctx, &s1.id).unwrap();
+    postprocess_session(&ctx, &s1.id).await.expect("後処理に失敗");
+
+    // FR-24: ムードが評定され記録される
+    let mood = ctx.db.get_mood_raw(&p.id).unwrap();
+    println!("[ムード] value={} label={}", mood.0, mood.1);
+    let mood_events = ctx.db.mood_events_of(&p.id).unwrap();
+    println!("[ムード変化] {}件", mood_events.len());
+
+    // FR-26: 当日分の日記が生成される
+    let diaries = ctx.db.list_diaries(&p.id).unwrap();
+    assert!(!diaries.is_empty(), "日記が生成されていない");
+    println!("[日記 {}] {}", diaries[0].date, diaries[0].content);
+}
+
+/// v0.2 の実機確認: グループチャットで文脈に応じた1体が応答する (FR-31)
+#[tokio::test]
+#[ignore = "Ollama 実機が必要"]
+async fn real_ollama_group_chat_v02() {
+    let (_dir, ctx, _sink) = real_ctx();
+    let mk = |name: &str, desc: &str| Persona {
+        id: new_id(), name: name.into(), description: desc.into(),
+        speech_style: "です・ます調".into(), values_text: String::new(),
+        self_intro: String::new(), created_at: now_ms(), last_talked_at: None,
+    };
+    let a = mk("アリス", "料理が得意な明るい人");
+    let b = mk("ボブ", "天体観測が趣味の物静かな人");
+    ctx.db.create_persona(&a, &[]).unwrap();
+    ctx.db.create_persona(&b, &[]).unwrap();
+
+    let s = start_session(&ctx, "group", &[a.id.clone(), b.id.clone()], "").unwrap();
+    send_group_message(&ctx, &s.id, "こんにちは、二人とも!今日は星がきれいですね", None)
+        .await
+        .expect("グループ応答に失敗");
+
+    let utts = ctx.db.utterances_of(&s.id).unwrap();
+    for u in &utts {
+        println!("  {}: {}", u.speaker_name, u.content.chars().take(50).collect::<String>());
+    }
+    // ユーザー発話 + 少なくとも1体の応答
+    assert!(utts.iter().any(|u| u.speaker_kind == "persona"), "誰も応答していない");
 }

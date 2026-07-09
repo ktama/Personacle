@@ -5,6 +5,10 @@ import { errorMessage, isAppError } from "./types";
 import { clear, confirmDialog, el, toast } from "./ui";
 import { autonomousView, type AutonomousController } from "./views/autonomous";
 import { chatView, type ChatController } from "./views/chat";
+import { dashboardView } from "./views/dashboard";
+import { diaryView } from "./views/diary";
+import { graphView } from "./views/graph";
+import { groupView, type GroupController } from "./views/group";
 import { memoriesView } from "./views/memories";
 import { personaFormView } from "./views/personaForm";
 import { personalityView } from "./views/personality";
@@ -16,14 +20,18 @@ type View =
   | { kind: "create" }
   | { kind: "persona"; personaId: string; tab: PersonaTab }
   | { kind: "autonomous" }
+  | { kind: "group" }
+  | { kind: "graph" }
   | { kind: "settings" };
 
-type PersonaTab = "chat" | "memories" | "personality" | "sessions" | "edit";
+type PersonaTab = "chat" | "memories" | "personality" | "dashboard" | "diary" | "sessions" | "edit";
 
 const TAB_LABELS: Record<PersonaTab, string> = {
   chat: "チャット",
   memories: "記憶",
   personality: "人格",
+  dashboard: "成長",
+  diary: "日記",
   sessions: "履歴",
   edit: "編集",
 };
@@ -34,6 +42,7 @@ class App {
   private view: View = { kind: "onboarding" };
   private chat: ChatController | null = null;
   private auto: AutonomousController | null = null;
+  private group: GroupController | null = null;
 
   constructor(root: HTMLElement) {
     this.root = root;
@@ -44,17 +53,22 @@ class App {
       onUtteranceStarted: (p) => {
         if (this.chat?.sessionId() === p.sessionId) this.chat.onUtteranceStarted(p.utteranceId, p.speakerName);
         if (this.auto?.sessionId() === p.sessionId) this.auto.onUtteranceStarted(p.utteranceId, p.speakerName);
+        if (this.group?.sessionId() === p.sessionId) this.group.onUtteranceStarted(p.utteranceId, p.speakerName);
       },
       onUtteranceDelta: (p) => {
         if (this.chat?.sessionId() === p.sessionId) this.chat.onUtteranceDelta(p.utteranceId, p.delta);
         if (this.auto?.sessionId() === p.sessionId) this.auto.onUtteranceDelta(p.utteranceId, p.delta);
+        if (this.group?.sessionId() === p.sessionId) this.group.onUtteranceDelta(p.utteranceId, p.delta);
       },
       onUtteranceCompleted: (p) => {
         if (this.chat?.sessionId() === p.sessionId) this.chat.onUtteranceCompleted(p.utteranceId, p.state);
+        if (this.group?.sessionId() === p.sessionId) this.group.onUtteranceCompleted(p.utteranceId, p.state);
       },
       onGenerationFailed: (p) => {
         if (this.chat?.sessionId() === p.sessionId) {
           this.chat.onGenerationFailed(p.message, p.kind);
+        } else if (this.group?.sessionId() === p.sessionId) {
+          this.group.onGenerationFailed(p.message, p.kind);
         } else {
           toast(p.message, "error");
         }
@@ -62,9 +76,17 @@ class App {
       onSessionStatusChanged: (p) => {
         this.auto?.onSessionStatusChanged(p.sessionId, p.status);
       },
+      onSpeakerSelecting: (p) => {
+        if (this.group?.sessionId() === p.sessionId) this.group.onSpeakerSelecting();
+      },
       onPostprocessCompleted: (p) => {
-        if (p.memoryCount > 0 || p.eventCount > 0) {
-          toast(`会話から ${p.memoryCount} 件の記憶と ${p.eventCount} 件の変化が生まれました`);
+        const parts: string[] = [];
+        if (p.memoryCount > 0) parts.push(`${p.memoryCount} 件の記憶`);
+        if (p.eventCount > 0) parts.push(`${p.eventCount} 件の変化`);
+        if (p.consolidatedCount > 0) parts.push(`${p.consolidatedCount} 件の記憶の整理`);
+        if (parts.length > 0) {
+          const diary = p.diaryUpdated ? "。日記も書きました" : "";
+          toast(`会話から ${parts.join("、")} が生まれました${diary}`);
         }
       },
     });
@@ -100,6 +122,11 @@ class App {
         await this.chat.dispose();
         this.chat = null;
       }
+    }
+    // グループから離れるときもセッションを閉じる (EC-19/後処理)
+    if (this.group && view.kind !== "group") {
+      await this.group.dispose();
+      this.group = null;
     }
     this.view = view;
     this.render();
@@ -141,6 +168,16 @@ class App {
           text: "自律会話",
           onClick: () => void this.navigate({ kind: "autonomous" }),
         }),
+        el("button", {
+          class: `side-item side-action ${this.view.kind === "group" ? "active" : ""}`,
+          text: "グループチャット",
+          onClick: () => void this.navigate({ kind: "group" }),
+        }),
+        el("button", {
+          class: `side-item side-action ${this.view.kind === "graph" ? "active" : ""}`,
+          text: "関係図",
+          onClick: () => void this.navigate({ kind: "graph" }),
+        }),
       );
     }
     items.push(
@@ -172,6 +209,18 @@ class App {
       case "autonomous":
         this.auto = autonomousView(this.personas);
         main.append(this.auto.root);
+        break;
+      case "group":
+        this.group = groupView({
+          personas: this.personas,
+          openSettings: () => void this.navigate({ kind: "settings" }),
+        });
+        main.append(this.group.root);
+        break;
+      case "graph":
+        main.append(
+          graphView((personaId) => void this.navigate({ kind: "persona", personaId, tab: "personality" })),
+        );
         break;
       case "persona":
         main.append(this.personaArea(this.view.personaId, this.view.tab));
@@ -215,6 +264,12 @@ class App {
           .getPersona(personaId)
           .then((detail) => body.replaceChildren(personalityView(detail)))
           .catch((e) => body.replaceChildren(el("p", { class: "empty-note", text: errorMessage(e) })));
+        break;
+      case "dashboard":
+        body.append(dashboardView(personaId));
+        break;
+      case "diary":
+        body.append(diaryView(personaId));
         break;
       case "sessions":
         body.append(sessionsView(personaId));
